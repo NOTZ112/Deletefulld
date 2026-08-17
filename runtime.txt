@@ -1,4 +1,1 @@
-.env
-*.session
-__pycache__/
-*.pyc
+python-3.12.11
