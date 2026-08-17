@@ -1,29 +1,36 @@
 import os
 import asyncio
 import logging
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError
 
-from telegram import Update
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
 )
+
 
 # ============================================================
 # LOGGING
 # ============================================================
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     level=logging.INFO,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("duplicate-cleaner")
 
 
 # ============================================================
@@ -31,20 +38,11 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
 API_ID_RAW = os.getenv("API_ID", "").strip()
 API_HASH = os.getenv("API_HASH", "").strip()
-
 STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
-
-CHAT_ID_RAW = os.getenv("CHAT_ID", "").strip()
-
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
 
-
-# ============================================================
-# VALIDATION
-# ============================================================
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -58,18 +56,20 @@ if not API_HASH:
 if not STRING_SESSION:
     raise RuntimeError("STRING_SESSION is missing")
 
-if not CHAT_ID_RAW:
-    raise RuntimeError("CHAT_ID is missing")
-
 
 API_ID = int(API_ID_RAW)
-CHAT_ID = int(CHAT_ID_RAW)
 
 
-def parse_admin_ids():
+# ============================================================
+# ADMIN IDS
+# ============================================================
+
+def parse_admin_ids(value: str) -> set:
+
     result = set()
 
-    for item in ADMIN_IDS_RAW.split(","):
+    for item in value.split(","):
+
         item = item.strip()
 
         if not item:
@@ -78,16 +78,19 @@ def parse_admin_ids():
         try:
             result.add(int(item))
         except ValueError:
-            pass
+            logger.warning(
+                "Invalid ADMIN_IDS value: %s",
+                item
+            )
 
     return result
 
 
-ADMIN_IDS = parse_admin_ids()
+ADMIN_IDS = parse_admin_ids(ADMIN_IDS_RAW)
 
 
 # ============================================================
-# TELETHON CLIENT
+# TELETHON
 # ============================================================
 
 telethon_client = TelegramClient(
@@ -98,21 +101,75 @@ telethon_client = TelegramClient(
 
 
 # ============================================================
+# SETTINGS
+# ============================================================
+
+CHAT_PAGE_SIZE = 8
+
+DELETE_BATCH_SIZE = 100
+
+PROGRESS_SCAN_EVERY = 500
+
+PROGRESS_DELETE_EVERY = 100
+
+# Small pause between delete batches.
+DELETE_PAUSE = 0.20
+
+
+# ============================================================
 # GLOBAL STATE
 # ============================================================
 
-scan_task: Optional[asyncio.Task] = None
+selected_chats: Dict[int, int] = {}
 
-stop_event = asyncio.Event()
+chat_pages: Dict[int, int] = {}
 
-state = {
-    "running": False,
-    "scanned": 0,
-    "duplicates": 0,
-    "deleted": 0,
-    "remaining": 0,
-    "status": "Idle",
-}
+chat_cache: Dict[
+    int,
+    List[Tuple[int, str, str]]
+] = {}
+
+running_tasks: Dict[int, asyncio.Task] = {}
+
+stop_events: Dict[int, asyncio.Event] = {}
+
+progress_messages: Dict[int, object] = {}
+
+states: Dict[int, dict] = {}
+
+
+# ============================================================
+# STATE
+# ============================================================
+
+def get_state(user_id: int) -> dict:
+
+    if user_id not in states:
+
+        states[user_id] = {
+            "running": False,
+            "status": "Idle",
+            "chat_name": "None",
+            "scanned": 0,
+            "duplicates": 0,
+            "deleted": 0,
+            "remaining": 0,
+        }
+
+    return states[user_id]
+
+
+def reset_state(user_id: int):
+
+    states[user_id] = {
+        "running": False,
+        "status": "Idle",
+        "chat_name": "None",
+        "scanned": 0,
+        "duplicates": 0,
+        "deleted": 0,
+        "remaining": 0,
+    }
 
 
 # ============================================================
@@ -120,26 +177,450 @@ state = {
 # ============================================================
 
 def is_admin(user_id: int) -> bool:
+
     return user_id in ADMIN_IDS
 
 
-async def admin_only(update: Update) -> bool:
+async def require_admin(
+    update: Update,
+) -> bool:
 
-    if not update.effective_user:
+    user = update.effective_user
+
+    if not user:
         return False
 
-    user_id = update.effective_user.id
+    if is_admin(user.id):
+        return True
 
-    if not is_admin(user_id):
+    if update.callback_query:
 
-        if update.effective_message:
-            await update.effective_message.reply_text(
-                "❌ You are not authorized to use this bot."
+        try:
+            await update.callback_query.answer(
+                "❌ Not authorized.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+
+    elif update.effective_message:
+
+        await update.effective_message.reply_text(
+            "❌ You are not authorized to use this bot."
+        )
+
+    return False
+
+
+# ============================================================
+# TELETHON CONNECT
+# ============================================================
+
+async def ensure_telethon_connected():
+
+    if not telethon_client.is_connected():
+
+        await telethon_client.connect()
+
+    if not await telethon_client.is_user_authorized():
+
+        raise RuntimeError(
+            "STRING_SESSION is not authorized."
+        )
+
+
+# ============================================================
+# GET ADMIN CHATS
+# ============================================================
+
+async def get_admin_chats():
+
+    await ensure_telethon_connected()
+
+    me = await telethon_client.get_me()
+
+    result = []
+
+    async for dialog in telethon_client.iter_dialogs():
+
+        entity = dialog.entity
+
+        # Only groups/channels
+        if not (
+            getattr(dialog, "is_group", False)
+            or getattr(dialog, "is_channel", False)
+        ):
+            continue
+
+        try:
+
+            permissions = await telethon_client.get_permissions(
+                entity,
+                me,
             )
 
-        return False
+            is_creator = bool(
+                getattr(permissions, "is_creator", False)
+            )
 
-    return True
+            is_admin = bool(
+                getattr(permissions, "is_admin", False)
+            )
+
+            if not (is_creator or is_admin):
+                continue
+
+        except Exception as e:
+
+            logger.warning(
+                "Could not check permissions for %s: %s",
+                getattr(entity, "title", "Unknown"),
+                e,
+            )
+
+            continue
+
+        chat_id = int(entity.id)
+
+        # Telethon entity IDs need -100 prefix for channels.
+        if getattr(entity, "broadcast", False) or getattr(
+            entity,
+            "megagroup",
+            False,
+        ):
+
+            chat_id = int(
+                f"-100{entity.id}"
+            )
+
+        title = (
+            getattr(entity, "title", None)
+            or dialog.name
+            or "Unknown Chat"
+        )
+
+        if getattr(entity, "broadcast", False):
+
+            chat_type = "📢 Channel"
+
+        elif getattr(entity, "megagroup", False):
+
+            chat_type = "👥 Supergroup"
+
+        else:
+
+            chat_type = "👥 Group"
+
+        result.append(
+            (
+                chat_id,
+                title,
+                chat_type,
+            )
+        )
+
+    result.sort(
+        key=lambda x: x[1].lower()
+    )
+
+    return result
+
+
+# ============================================================
+# CHAT ENTITY
+# ============================================================
+
+async def get_entity_from_chat_id(chat_id: int):
+
+    await ensure_telethon_connected()
+
+    return await telethon_client.get_entity(
+        chat_id
+    )
+
+
+# ============================================================
+# MAIN MENU
+# ============================================================
+
+def main_menu():
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🔗 Connect Chat",
+                callback_data="connect"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📊 Status",
+                callback_data="status"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ Stop",
+                callback_data="stop"
+            )
+        ],
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+# ============================================================
+# CHAT LIST
+# ============================================================
+
+def build_chat_keyboard(
+    user_id: int,
+    chats: List[Tuple[int, str, str]],
+    page: int,
+):
+
+    start = page * CHAT_PAGE_SIZE
+
+    current = chats[
+        start:start + CHAT_PAGE_SIZE
+    ]
+
+    keyboard = []
+
+    for index, (
+        chat_id,
+        title,
+        chat_type,
+    ) in enumerate(current):
+
+        absolute_index = start + index
+
+        # callback data contains local index
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"{chat_type} {title[:35]}",
+                    callback_data=(
+                        f"select:{absolute_index}"
+                    ),
+                )
+            ]
+        )
+
+    navigation = []
+
+    if page > 0:
+
+        navigation.append(
+            InlineKeyboardButton(
+                "⬅️ Previous",
+                callback_data=f"page:{page - 1}",
+            )
+        )
+
+    if start + CHAT_PAGE_SIZE < len(chats):
+
+        navigation.append(
+            InlineKeyboardButton(
+                "Next ➡️",
+                callback_data=f"page:{page + 1}",
+            )
+        )
+
+    if navigation:
+
+        keyboard.append(navigation)
+
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "🔄 Refresh",
+                callback_data="refresh",
+            ),
+            InlineKeyboardButton(
+                "🏠 Home",
+                callback_data="home",
+            ),
+        ]
+    )
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+# ============================================================
+# CHAT LIST MESSAGE
+# ============================================================
+
+async def show_chat_list(
+    query,
+    user_id: int,
+    page: int = 0,
+):
+
+    try:
+
+        if (
+            user_id not in chat_cache
+            or page == 0
+        ):
+
+            chats = await get_admin_chats()
+
+            chat_cache[user_id] = chats
+
+        else:
+
+            chats = chat_cache[user_id]
+
+        chat_pages[user_id] = page
+
+        if not chats:
+
+            await query.edit_message_text(
+                "📂 <b>Admin Chats</b>\n\n"
+                "❌ No groups/channels found "
+                "where the String Session account "
+                "is an administrator.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "🔄 Refresh",
+                                callback_data="refresh",
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                "🏠 Home",
+                                callback_data="home",
+                            )
+                        ],
+                    ]
+                ),
+            )
+
+            return
+
+        total_pages = (
+            len(chats) + CHAT_PAGE_SIZE - 1
+        ) // CHAT_PAGE_SIZE
+
+        text = (
+            "📂 <b>ADMIN CHATS</b>\n\n"
+            f"Total: <b>{len(chats)}</b>\n"
+            f"Page: <b>{page + 1}/{total_pages}</b>\n\n"
+            "Select a group or channel:"
+        )
+
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_chat_keyboard(
+                user_id,
+                chats,
+                page,
+            ),
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Could not load chat list"
+        )
+
+        await query.edit_message_text(
+            "❌ Failed to load chats.\n\n"
+            f"<code>{str(e)[:800]}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔄 Try Again",
+                            callback_data="refresh",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+
+# ============================================================
+# SELECTED CHAT MENU
+# ============================================================
+
+def selected_chat_menu():
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔍 Scan Duplicates",
+                    callback_data="scan",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔗 Change Chat",
+                    callback_data="connect",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏠 Home",
+                    callback_data="home",
+                )
+            ],
+        ]
+    )
+
+
+async def show_selected_chat(
+    query,
+    user_id: int,
+):
+
+    chat_id = selected_chats.get(user_id)
+
+    if not chat_id:
+
+        await query.edit_message_text(
+            "❌ No chat connected.",
+            reply_markup=main_menu(),
+        )
+
+        return
+
+    state = get_state(user_id)
+
+    await query.edit_message_text(
+        "✅ <b>CHAT CONNECTED</b>\n\n"
+        f"📌 Chat: <b>{state['chat_name']}</b>\n"
+        f"🆔 ID: <code>{chat_id}</code>\n\n"
+        "Ready to scan old messages.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=selected_chat_menu(),
+    )
+
+
+# ============================================================
+# PROGRESS TEXT
+# ============================================================
+
+def state_text(user_id: int):
+
+    state = get_state(user_id)
+
+    return (
+        "🧹 <b>DUPLICATE CLEANER</b>\n\n"
+        f"📌 Chat: <b>{state['chat_name']}</b>\n\n"
+        f"🔍 Scanned: <b>{state['scanned']:,}</b>\n"
+        f"♻️ Duplicates: <b>{state['duplicates']:,}</b>\n"
+        f"🗑️ Deleted: <b>{state['deleted']:,}</b>\n"
+        f"⏳ Remaining: <b>{state['remaining']:,}</b>\n\n"
+        f"📌 Status: <b>{state['status']}</b>"
+    )
 
 
 # ============================================================
@@ -151,19 +632,15 @@ def get_media_key(message):
     """
     Fast duplicate detection.
 
-    For documents/videos/audio/files:
-        Telegram document ID
+    This compares Telegram media/document IDs.
 
-    For photos:
-        Telegram photo ID
-
-    This is fast because we do NOT download the media.
+    It does NOT download files.
     """
 
     if not message.media:
         return None
 
-    # Document / Video / Audio / File
+    # Documents include videos, files, audio, etc.
     if getattr(message, "document", None):
 
         document = message.document
@@ -173,7 +650,7 @@ def get_media_key(message):
             int(document.id),
         )
 
-    # Photo
+    # Photos
     if getattr(message, "photo", None):
 
         photo = message.photo
@@ -187,78 +664,86 @@ def get_media_key(message):
 
 
 # ============================================================
-# PROGRESS TEXT
+# PROGRESS EDIT
 # ============================================================
 
-def progress_text():
-
-    return (
-        "🧹 <b>Duplicate Cleaner</b>\n\n"
-        f"🔍 Scanned: <b>{state['scanned']:,}</b>\n"
-        f"♻️ Duplicates: <b>{state['duplicates']:,}</b>\n"
-        f"🗑️ Deleted: <b>{state['deleted']:,}</b>\n"
-        f"⏳ Remaining: <b>{state['remaining']:,}</b>\n\n"
-        f"📌 Status: <b>{state['status']}</b>"
-    )
-
-
-# ============================================================
-# SAFE MESSAGE EDIT
-# ============================================================
-
-async def update_progress_message(message):
+async def edit_progress(
+    message,
+    user_id: int,
+):
 
     try:
 
         await message.edit_text(
-            progress_text(),
-            parse_mode="HTML",
+            state_text(user_id),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🛑 Stop",
+                            callback_data="stop",
+                        )
+                    ]
+                ]
+            ),
         )
 
     except Exception as e:
 
-        logger.warning(
-            "Progress message update failed: %s",
+        logger.debug(
+            "Progress edit failed: %s",
             e,
         )
 
 
 # ============================================================
-# SCANNER
+# CLEANUP TASK
 # ============================================================
 
-async def perform_scan(progress_message):
+async def cleanup_chat(
+    user_id: int,
+    progress_message,
+):
 
-    global scan_task
+    state = get_state(user_id)
+
+    chat_id = selected_chats.get(user_id)
+
+    if not chat_id:
+
+        state["status"] = "No chat selected"
+        state["running"] = False
+
+        return
 
     state["running"] = True
-    state["status"] = "Scanning history"
-
+    state["status"] = "Scanning"
     state["scanned"] = 0
     state["duplicates"] = 0
     state["deleted"] = 0
     state["remaining"] = 0
 
-    stop_event.clear()
+    stop_event = asyncio.Event()
 
-    # Stores media keys already seen.
+    stop_events[user_id] = stop_event
+
     seen = set()
 
-    # Duplicate Telegram message IDs.
-    duplicate_message_ids = []
-
-    last_update = 0
+    duplicate_ids = []
 
     try:
 
-        logger.info("Starting scan for chat %s", CHAT_ID)
+        entity = await get_entity_from_chat_id(
+            chat_id
+        )
 
-        await telethon_client.start()
+        logger.info(
+            "Starting scan: %s",
+            state["chat_name"]
+        )
 
-        # Make sure the account can access the chat.
-        entity = await telethon_client.get_entity(CHAT_ID)
-
-        logger.info("Scanning chat: %s", entity)
+        last_progress = 0
 
         async for message in telethon_client.iter_messages(
             entity,
@@ -268,71 +753,68 @@ async def perform_scan(progress_message):
             if stop_event.is_set():
 
                 state["status"] = "Stopped"
-
                 break
 
             state["scanned"] += 1
 
-            media_key = get_media_key(message)
+            key = get_media_key(message)
 
-            if media_key is None:
+            if key is None:
                 continue
 
-            if media_key in seen:
+            if key in seen:
 
-                state["duplicates"] += 1
-
-                duplicate_message_ids.append(
+                duplicate_ids.append(
                     message.id
                 )
 
+                state["duplicates"] += 1
+
             else:
 
-                seen.add(media_key)
+                seen.add(key)
 
             state["remaining"] = (
-                len(duplicate_message_ids)
+                len(duplicate_ids)
                 - state["deleted"]
             )
 
-            # Update Telegram message periodically.
             if (
-                state["scanned"] - last_update
-                >= 500
+                state["scanned"]
+                - last_progress
+                >= PROGRESS_SCAN_EVERY
             ):
 
-                last_update = state["scanned"]
+                last_progress = (
+                    state["scanned"]
+                )
 
-                await update_progress_message(
-                    progress_message
+                await edit_progress(
+                    progress_message,
+                    user_id,
                 )
 
                 await asyncio.sleep(0)
 
-        # Final scan update.
-        await update_progress_message(
-            progress_message
-        )
-
         if stop_event.is_set():
 
-            state["status"] = "Stopped during scan"
+            state["status"] = "Stopped"
 
-            await update_progress_message(
-                progress_message
+            await edit_progress(
+                progress_message,
+                user_id,
             )
 
             return
 
-        # Nothing found.
-        if not duplicate_message_ids:
+        if not duplicate_ids:
 
             state["status"] = "Completed"
-
             state["remaining"] = 0
 
-            await update_progress_message(
-                progress_message
+            await edit_progress(
+                progress_message,
+                user_id,
             )
 
             return
@@ -341,69 +823,36 @@ async def perform_scan(progress_message):
         # DELETE
         # ====================================================
 
-        state["status"] = "Deleting duplicates"
+        state["status"] = "Deleting"
 
-        await update_progress_message(
-            progress_message
+        await edit_progress(
+            progress_message,
+            user_id,
         )
 
-        batch_size = 100
-
         total_duplicates = len(
-            duplicate_message_ids
+            duplicate_ids
         )
 
         for start in range(
             0,
             total_duplicates,
-            batch_size,
+            DELETE_BATCH_SIZE,
         ):
 
             if stop_event.is_set():
 
                 state["status"] = "Stopped"
-
                 break
 
-            batch = duplicate_message_ids[
-                start:start + batch_size
+            batch = duplicate_ids[
+                start:start + DELETE_BATCH_SIZE
             ]
 
-            try:
+            success = False
 
-                await telethon_client.delete_messages(
-                    entity,
-                    batch,
-                    revoke=True,
-                )
+            while not success:
 
-                state["deleted"] += len(batch)
-
-                state["remaining"] = (
-                    total_duplicates
-                    - state["deleted"]
-                )
-
-            except FloodWaitError as e:
-
-                state["status"] = (
-                    f"FloodWait {e.seconds}s"
-                )
-
-                await update_progress_message(
-                    progress_message
-                )
-
-                logger.warning(
-                    "FloodWait: sleeping %s seconds",
-                    e.seconds,
-                )
-
-                await asyncio.sleep(
-                    e.seconds
-                )
-
-                # Retry
                 try:
 
                     await telethon_client.delete_messages(
@@ -411,6 +860,8 @@ async def perform_scan(progress_message):
                         batch,
                         revoke=True,
                     )
+
+                    success = True
 
                     state["deleted"] += len(
                         batch
@@ -421,33 +872,61 @@ async def perform_scan(progress_message):
                         - state["deleted"]
                     )
 
-                except Exception as retry_error:
+                except FloodWaitError as e:
 
-                    logger.exception(
-                        "Retry delete failed: %s",
-                        retry_error,
+                    state["status"] = (
+                        f"Waiting {e.seconds}s"
                     )
 
-            except RPCError as e:
+                    await edit_progress(
+                        progress_message,
+                        user_id,
+                    )
 
-                logger.error(
-                    "Telegram RPC error: %s",
-                    e,
-                )
+                    logger.warning(
+                        "FloodWait: %s seconds",
+                        e.seconds,
+                    )
 
-            except Exception as e:
+                    await asyncio.sleep(
+                        e.seconds
+                    )
 
-                logger.exception(
-                    "Delete error: %s",
-                    e,
-                )
+                    state["status"] = "Deleting"
 
-            # Update every batch.
-            await update_progress_message(
-                progress_message
+                except RPCError as e:
+
+                    logger.error(
+                        "Telegram RPC error: %s",
+                        e,
+                    )
+
+                    state["status"] = (
+                        "Delete error"
+                    )
+
+                    break
+
+                except Exception as e:
+
+                    logger.exception(
+                        "Delete error"
+                    )
+
+                    state["status"] = (
+                        "Delete error"
+                    )
+
+                    break
+
+            await edit_progress(
+                progress_message,
+                user_id,
             )
 
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(
+                DELETE_PAUSE
+            )
 
         if stop_event.is_set():
 
@@ -459,17 +938,19 @@ async def perform_scan(progress_message):
 
         else:
 
-            state["status"] = "Completed with errors"
+            state["status"] = (
+                "Completed with errors"
+            )
 
-        await update_progress_message(
-            progress_message
+        await edit_progress(
+            progress_message,
+            user_id,
         )
 
     except Exception as e:
 
         logger.exception(
-            "Scanner error: %s",
-            e,
+            "Cleanup failed"
         )
 
         state["status"] = "Error"
@@ -477,9 +958,12 @@ async def perform_scan(progress_message):
         try:
 
             await progress_message.edit_text(
-                progress_text()
-                + f"\n\n❌ <b>Error:</b> {str(e)[:1000]}",
-                parse_mode="HTML",
+                state_text(user_id)
+                + "\n\n"
+                + "❌ <b>Error:</b>\n"
+                + f"<code>{str(e)[:1000]}</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu(),
             )
 
         except Exception:
@@ -489,11 +973,19 @@ async def perform_scan(progress_message):
 
         state["running"] = False
 
-        scan_task = None
+        running_tasks.pop(
+            user_id,
+            None,
+        )
+
+        stop_events.pop(
+            user_id,
+            None,
+        )
 
 
 # ============================================================
-# /start
+# /START
 # ============================================================
 
 async def start_command(
@@ -501,57 +993,48 @@ async def start_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not await admin_only(update):
+    if not await require_admin(update):
         return
 
-    text = (
-        "🧹 <b>Duplicate Cleaner</b>\n\n"
-        "Commands:\n\n"
-        "/scan - Scan and delete duplicates\n"
-        "/status - Show current status\n"
-        "/stop - Stop current scan\n"
-        "/help - Show help"
+    user_id = update.effective_user.id
+
+    state = get_state(user_id)
+
+    selected = selected_chats.get(
+        user_id
     )
+
+    if selected:
+
+        text = (
+            "🧹 <b>DUPLICATE CLEANER</b>\n\n"
+            f"📌 Connected: "
+            f"<b>{state['chat_name']}</b>\n\n"
+            "Choose an option:"
+        )
+
+    else:
+
+        text = (
+            "🧹 <b>DUPLICATE CLEANER</b>\n\n"
+            "Clean old duplicate media from "
+            "your admin groups/channels.\n\n"
+            "👇 Connect a chat to begin."
+        )
 
     await update.message.reply_text(
         text,
-        parse_mode="HTML",
+        parse_mode=ParseMode.HTML,
+        reply_markup=(
+            selected_chat_menu()
+            if selected
+            else main_menu()
+        ),
     )
 
 
 # ============================================================
-# /help
-# ============================================================
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await admin_only(update):
-        return
-
-    text = (
-        "🧹 <b>Duplicate Cleaner Help</b>\n\n"
-        "Use:\n"
-        "/scan\n\n"
-        "The cleaner will:\n"
-        "🔍 Scan old messages\n"
-        "♻️ Detect duplicate media\n"
-        "🗑️ Delete duplicates in batches\n"
-        "📊 Show live progress\n\n"
-        "/status - Current status\n"
-        "/stop - Stop operation"
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# /status
+# /STATUS
 # ============================================================
 
 async def status_command(
@@ -559,17 +1042,19 @@ async def status_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not await admin_only(update):
+    if not await require_admin(update):
         return
 
+    user_id = update.effective_user.id
+
     await update.message.reply_text(
-        progress_text(),
-        parse_mode="HTML",
+        state_text(user_id),
+        parse_mode=ParseMode.HTML,
     )
 
 
 # ============================================================
-# /stop
+# /STOP
 # ============================================================
 
 async def stop_command(
@@ -577,18 +1062,28 @@ async def stop_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not await admin_only(update):
+    if not await require_admin(update):
         return
 
-    if not state["running"]:
+    user_id = update.effective_user.id
+
+    event = stop_events.get(
+        user_id
+    )
+
+    state = get_state(user_id)
+
+    if not state["running"] or not event:
 
         await update.message.reply_text(
-            "ℹ️ No cleanup is currently running."
+            "ℹ️ Nothing is running."
         )
 
         return
 
-    stop_event.set()
+    event.set()
+
+    state["status"] = "Stopping..."
 
     await update.message.reply_text(
         "🛑 Stop requested.\n\n"
@@ -597,79 +1092,335 @@ async def stop_command(
 
 
 # ============================================================
-# /scan
+# CALLBACK HANDLER
 # ============================================================
 
-async def scan_command(
+async def callback_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    global scan_task
+    query = update.callback_query
 
-    if not await admin_only(update):
-        return
+    await query.answer()
 
-    if state["running"]:
+    user = query.from_user
 
-        await update.message.reply_text(
-            "⚠️ A cleanup is already running.\n\n"
-            "Use /status to see progress."
+    if not is_admin(user.id):
+
+        await query.answer(
+            "❌ Not authorized.",
+            show_alert=True,
         )
 
         return
 
-    progress_message = await update.message.reply_text(
-        "🧹 <b>Duplicate Cleaner</b>\n\n"
-        "🚀 Starting...",
-        parse_mode="HTML",
-    )
+    user_id = user.id
 
-    stop_event.clear()
+    data = query.data
 
-    scan_task = asyncio.create_task(
-        perform_scan(
-            progress_message
+    # --------------------------------------------------------
+    # HOME
+    # --------------------------------------------------------
+
+    if data == "home":
+
+        state = get_state(user_id)
+
+        if user_id in selected_chats:
+
+            await query.edit_message_text(
+                "🧹 <b>DUPLICATE CLEANER</b>\n\n"
+                f"📌 Connected: "
+                f"<b>{state['chat_name']}</b>\n\n"
+                "Choose an option:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=selected_chat_menu(),
+            )
+
+        else:
+
+            await query.edit_message_text(
+                "🧹 <b>DUPLICATE CLEANER</b>\n\n"
+                "Choose an option:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu(),
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # CONNECT
+    # --------------------------------------------------------
+
+    if data == "connect":
+
+        await show_chat_list(
+            query,
+            user_id,
+            0,
         )
-    )
 
-    await asyncio.sleep(0.1)
+        return
+
+    # --------------------------------------------------------
+    # REFRESH
+    # --------------------------------------------------------
+
+    if data == "refresh":
+
+        chat_cache.pop(
+            user_id,
+            None,
+        )
+
+        await show_chat_list(
+            query,
+            user_id,
+            0,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # PAGE
+    # --------------------------------------------------------
+
+    if data.startswith("page:"):
+
+        try:
+
+            page = int(
+                data.split(":", 1)[1]
+            )
+
+        except ValueError:
+
+            page = 0
+
+        await show_chat_list(
+            query,
+            user_id,
+            page,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # SELECT CHAT
+    # --------------------------------------------------------
+
+    if data.startswith("select:"):
+
+        try:
+
+            index = int(
+                data.split(":", 1)[1]
+            )
+
+        except ValueError:
+
+            await query.edit_message_text(
+                "❌ Invalid selection.",
+                reply_markup=main_menu(),
+            )
+
+            return
+
+        chats = chat_cache.get(
+            user_id,
+            [],
+        )
+
+        if (
+            index < 0
+            or index >= len(chats)
+        ):
+
+            await query.edit_message_text(
+                "❌ Chat list expired.\n"
+                "Please refresh.",
+                reply_markup=main_menu(),
+            )
+
+            return
+
+        chat_id, title, chat_type = (
+            chats[index]
+        )
+
+        selected_chats[user_id] = (
+            chat_id
+        )
+
+        state = get_state(user_id)
+
+        state["chat_name"] = title
+        state["status"] = "Connected"
+
+        await query.edit_message_text(
+            "✅ <b>CHAT CONNECTED</b>\n\n"
+            f"📌 <b>{title}</b>\n"
+            f"📂 {chat_type}\n\n"
+            "You can now scan the old history.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=selected_chat_menu(),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # SCAN
+    # --------------------------------------------------------
+
+    if data == "scan":
+
+        if user_id not in selected_chats:
+
+            await query.edit_message_text(
+                "❌ Please connect a chat first.",
+                reply_markup=main_menu(),
+            )
+
+            return
+
+        state = get_state(user_id)
+
+        if state["running"]:
+
+            await query.answer(
+                "A scan is already running.",
+                show_alert=True,
+            )
+
+            return
+
+        state["status"] = "Starting"
+
+        progress_message = query.message
+
+        task = asyncio.create_task(
+            cleanup_chat(
+                user_id,
+                progress_message,
+            )
+        )
+
+        running_tasks[user_id] = task
+
+        await query.edit_message_text(
+            state_text(user_id),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🛑 Stop",
+                            callback_data="stop",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # STATUS
+    # --------------------------------------------------------
+
+    if data == "status":
+
+        await query.edit_message_text(
+            state_text(user_id),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu(),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # STOP
+    # --------------------------------------------------------
+
+    if data == "stop":
+
+        event = stop_events.get(
+            user_id
+        )
+
+        state = get_state(user_id)
+
+        if (
+            not state["running"]
+            or not event
+        ):
+
+            await query.edit_message_text(
+                "ℹ️ Nothing is running.",
+                reply_markup=main_menu(),
+            )
+
+            return
+
+        event.set()
+
+        state["status"] = "Stopping..."
+
+        await query.edit_message_text(
+            state_text(user_id),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu(),
+        )
+
+        return
 
 
 # ============================================================
-# BOT STARTUP
+# STARTUP
 # ============================================================
 
-async def post_init(application):
+async def post_init(
+    application: Application,
+):
 
     logger.info(
-        "Starting Telethon client..."
+        "Connecting Telethon..."
     )
 
-    await telethon_client.start()
+    await ensure_telethon_connected()
 
     me = await telethon_client.get_me()
 
     logger.info(
-        "Telethon logged in as: %s (%s)",
+        "Telethon account: %s (%s)",
         me.first_name,
         me.id,
     )
 
 
 # ============================================================
-# BOT SHUTDOWN
+# SHUTDOWN
 # ============================================================
 
-async def post_shutdown(application):
+async def post_shutdown(
+    application: Application,
+):
+
+    logger.info(
+        "Disconnecting Telethon..."
+    )
 
     try:
 
         await telethon_client.disconnect()
 
-    except Exception:
+    except Exception as e:
 
-        pass
+        logger.warning(
+            "Disconnect error: %s",
+            e,
+        )
 
 
 # ============================================================
@@ -695,20 +1446,6 @@ def main():
 
     application.add_handler(
         CommandHandler(
-            "help",
-            help_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "scan",
-            scan_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
             "status",
             status_command,
         )
@@ -721,16 +1458,24 @@ def main():
         )
     )
 
+    application.add_handler(
+        CallbackQueryHandler(
+            callback_handler
+        )
+    )
+
     logger.info(
-        "Duplicate Cleaner Bot started."
+        "Duplicate Cleaner started."
     )
 
     application.run_polling(
         allowed_updates=[
             "message",
+            "callback_query",
         ]
     )
 
 
 if __name__ == "__main__":
+
     main()
