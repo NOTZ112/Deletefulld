@@ -1,22 +1,25 @@
 import os
 import asyncio
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError
+
+from motor.motor_asyncio import AsyncIOMotorClient
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatMemberStatus
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
     ContextTypes,
 )
 
@@ -43,10 +46,14 @@ API_HASH = os.getenv("API_HASH", "").strip()
 STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
 
-# PIPE LOG GROUP
 PIPE_LOG_CHAT_ID_RAW = os.getenv(
     "PIPE_LOG_CHAT_ID",
-    ""
+    "",
+).strip()
+
+MONGO_URI = os.getenv(
+    "MONGO_URI",
+    "",
 ).strip()
 
 
@@ -64,6 +71,9 @@ if not STRING_SESSION:
 
 if not PIPE_LOG_CHAT_ID_RAW:
     raise RuntimeError("PIPE_LOG_CHAT_ID is missing")
+
+if not MONGO_URI:
+    raise RuntimeError("MONGO_URI is missing")
 
 
 API_ID = int(API_ID_RAW)
@@ -87,16 +97,35 @@ def parse_admin_ids(value: str) -> set:
 
         try:
             result.add(int(item))
+
         except ValueError:
+
             logger.warning(
                 "Invalid ADMIN_IDS value: %s",
-                item
+                item,
             )
 
     return result
 
 
 ADMIN_IDS = parse_admin_ids(ADMIN_IDS_RAW)
+
+
+# ============================================================
+# MONGODB
+# ============================================================
+
+mongo_client = AsyncIOMotorClient(
+    MONGO_URI
+)
+
+db = mongo_client[
+    "duplicate_cleaner"
+]
+
+approved_groups = db[
+    "approved_groups"
+]
 
 
 # ============================================================
@@ -122,7 +151,6 @@ PROGRESS_SCAN_EVERY = 500
 
 PROGRESS_DELETE_EVERY = 100
 
-# Small pause between duplicate delete batches.
 DELETE_PAUSE = 0.20
 
 
@@ -158,8 +186,14 @@ progress_messages: Dict[int, object] = {}
 
 states: Dict[int, dict] = {}
 
-# PIPE TASKS
 pipe_tasks: Dict[int, asyncio.Task] = {}
+
+
+# ============================================================
+# APPROVAL STATE
+# ============================================================
+
+pending_approvals: Dict[int, dict] = {}
 
 
 # ============================================================
@@ -237,6 +271,62 @@ async def require_admin(
 
 
 # ============================================================
+# APPROVED GROUP FUNCTIONS
+# ============================================================
+
+async def is_group_approved(
+    chat_id: int,
+) -> bool:
+
+    document = await approved_groups.find_one(
+        {
+            "_id": int(chat_id),
+            "approved": True,
+        }
+    )
+
+    return document is not None
+
+
+async def approve_group(
+    chat_id: int,
+    title: str,
+    approved_by: int,
+):
+
+    await approved_groups.update_one(
+        {
+            "_id": int(chat_id),
+        },
+        {
+            "$set": {
+                "title": title,
+                "approved": True,
+                "approved_by": int(approved_by),
+            }
+        },
+        upsert=True,
+    )
+
+
+async def reject_group(
+    chat_id: int,
+):
+
+    await approved_groups.update_one(
+        {
+            "_id": int(chat_id),
+        },
+        {
+            "$set": {
+                "approved": False,
+            }
+        },
+        upsert=True,
+    )
+
+
+# ============================================================
 # TELETHON CONNECT
 # ============================================================
 
@@ -269,7 +359,6 @@ async def get_admin_chats():
 
         entity = dialog.entity
 
-        # Only groups/channels
         if not (
             getattr(dialog, "is_group", False)
             or getattr(dialog, "is_channel", False)
@@ -284,11 +373,19 @@ async def get_admin_chats():
             )
 
             is_creator = bool(
-                getattr(permissions, "is_creator", False)
+                getattr(
+                    permissions,
+                    "is_creator",
+                    False,
+                )
             )
 
             is_admin = bool(
-                getattr(permissions, "is_admin", False)
+                getattr(
+                    permissions,
+                    "is_admin",
+                    False,
+                )
             )
 
             if not (is_creator or is_admin):
@@ -298,7 +395,11 @@ async def get_admin_chats():
 
             logger.warning(
                 "Could not check permissions for %s: %s",
-                getattr(entity, "title", "Unknown"),
+                getattr(
+                    entity,
+                    "title",
+                    "Unknown",
+                ),
                 e,
             )
 
@@ -306,8 +407,11 @@ async def get_admin_chats():
 
         chat_id = int(entity.id)
 
-        # Telethon entity IDs need -100 prefix for channels.
-        if getattr(entity, "broadcast", False) or getattr(
+        if getattr(
+            entity,
+            "broadcast",
+            False,
+        ) or getattr(
             entity,
             "megagroup",
             False,
@@ -318,16 +422,28 @@ async def get_admin_chats():
             )
 
         title = (
-            getattr(entity, "title", None)
+            getattr(
+                entity,
+                "title",
+                None,
+            )
             or dialog.name
             or "Unknown Chat"
         )
 
-        if getattr(entity, "broadcast", False):
+        if getattr(
+            entity,
+            "broadcast",
+            False,
+        ):
 
             chat_type = "📢 Channel"
 
-        elif getattr(entity, "megagroup", False):
+        elif getattr(
+            entity,
+            "megagroup",
+            False,
+        ):
 
             chat_type = "👥 Supergroup"
 
@@ -354,7 +470,9 @@ async def get_admin_chats():
 # CHAT ENTITY
 # ============================================================
 
-async def get_entity_from_chat_id(chat_id: int):
+async def get_entity_from_chat_id(
+    chat_id: int,
+):
 
     await ensure_telethon_connected()
 
@@ -373,24 +491,26 @@ def main_menu():
         [
             InlineKeyboardButton(
                 "🔗 Connect Chat",
-                callback_data="connect"
+                callback_data="connect",
             )
         ],
         [
             InlineKeyboardButton(
                 "📊 Status",
-                callback_data="status"
+                callback_data="status",
             )
         ],
         [
             InlineKeyboardButton(
                 "❌ Stop",
-                callback_data="stop"
+                callback_data="stop",
             )
         ],
     ]
 
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(
+        keyboard
+    )
 
 
 # ============================================================
@@ -419,7 +539,6 @@ def build_chat_keyboard(
 
         absolute_index = start + index
 
-        # callback data contains local index
         keyboard.append(
             [
                 InlineKeyboardButton(
@@ -438,22 +557,31 @@ def build_chat_keyboard(
         navigation.append(
             InlineKeyboardButton(
                 "⬅️ Previous",
-                callback_data=f"page:{page - 1}",
+                callback_data=(
+                    f"page:{page - 1}"
+                ),
             )
         )
 
-    if start + CHAT_PAGE_SIZE < len(chats):
+    if (
+        start + CHAT_PAGE_SIZE
+        < len(chats)
+    ):
 
         navigation.append(
             InlineKeyboardButton(
                 "Next ➡️",
-                callback_data=f"page:{page + 1}",
+                callback_data=(
+                    f"page:{page + 1}"
+                ),
             )
         )
 
     if navigation:
 
-        keyboard.append(navigation)
+        keyboard.append(
+            navigation
+        )
 
     keyboard.append(
         [
@@ -468,7 +596,9 @@ def build_chat_keyboard(
         ]
     )
 
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(
+        keyboard
+    )
 
 
 # ============================================================
@@ -527,13 +657,16 @@ async def show_chat_list(
             return
 
         total_pages = (
-            len(chats) + CHAT_PAGE_SIZE - 1
+            len(chats)
+            + CHAT_PAGE_SIZE
+            - 1
         ) // CHAT_PAGE_SIZE
 
         text = (
             "📂 <b>ADMIN CHATS</b>\n\n"
             f"Total: <b>{len(chats)}</b>\n"
-            f"Page: <b>{page + 1}/{total_pages}</b>\n\n"
+            f"Page: <b>{page + 1}/"
+            f"{total_pages}</b>\n\n"
             "Select a group or channel:"
         )
 
@@ -605,7 +738,9 @@ async def show_selected_chat(
     user_id: int,
 ):
 
-    chat_id = selected_chats.get(user_id)
+    chat_id = selected_chats.get(
+        user_id
+    )
 
     if not chat_id:
 
@@ -632,18 +767,25 @@ async def show_selected_chat(
 # PROGRESS TEXT
 # ============================================================
 
-def state_text(user_id: int):
+def state_text(
+    user_id: int,
+):
 
     state = get_state(user_id)
 
     return (
         "🧹 <b>DUPLICATE CLEANER</b>\n\n"
         f"📌 Chat: <b>{state['chat_name']}</b>\n\n"
-        f"🔍 Scanned: <b>{state['scanned']:,}</b>\n"
-        f"♻️ Duplicates: <b>{state['duplicates']:,}</b>\n"
-        f"🗑️ Deleted: <b>{state['deleted']:,}</b>\n"
-        f"⏳ Remaining: <b>{state['remaining']:,}</b>\n\n"
-        f"📌 Status: <b>{state['status']}</b>"
+        f"🔍 Scanned: "
+        f"<b>{state['scanned']:,}</b>\n"
+        f"♻️ Duplicates: "
+        f"<b>{state['duplicates']:,}</b>\n"
+        f"🗑️ Deleted: "
+        f"<b>{state['deleted']:,}</b>\n"
+        f"⏳ Remaining: "
+        f"<b>{state['remaining']:,}</b>\n\n"
+        f"📌 Status: "
+        f"<b>{state['status']}</b>"
     )
 
 
@@ -653,19 +795,14 @@ def state_text(user_id: int):
 
 def get_media_key(message):
 
-    """
-    Fast duplicate detection.
-
-    This compares Telegram media/document IDs.
-
-    It does NOT download files.
-    """
-
     if not message.media:
         return None
 
-    # Documents include videos, files, audio, etc.
-    if getattr(message, "document", None):
+    if getattr(
+        message,
+        "document",
+        None,
+    ):
 
         document = message.document
 
@@ -674,8 +811,11 @@ def get_media_key(message):
             int(document.id),
         )
 
-    # Photos
-    if getattr(message, "photo", None):
+    if getattr(
+        message,
+        "photo",
+        None,
+    ):
 
         photo = message.photo
 
@@ -732,11 +872,16 @@ async def cleanup_chat(
 
     state = get_state(user_id)
 
-    chat_id = selected_chats.get(user_id)
+    chat_id = selected_chats.get(
+        user_id
+    )
 
     if not chat_id:
 
-        state["status"] = "No chat selected"
+        state["status"] = (
+            "No chat selected"
+        )
+
         state["running"] = False
 
         return
@@ -764,24 +909,29 @@ async def cleanup_chat(
 
         logger.info(
             "Starting scan: %s",
-            state["chat_name"]
+            state["chat_name"],
         )
 
         last_progress = 0
 
-        async for message in telethon_client.iter_messages(
-            entity,
-            reverse=True,
+        async for message in (
+            telethon_client.iter_messages(
+                entity,
+                reverse=True,
+            )
         ):
 
             if stop_event.is_set():
 
                 state["status"] = "Stopped"
+
                 break
 
             state["scanned"] += 1
 
-            key = get_media_key(message)
+            key = get_media_key(
+                message
+            )
 
             if key is None:
                 continue
@@ -834,6 +984,7 @@ async def cleanup_chat(
         if not duplicate_ids:
 
             state["status"] = "Completed"
+
             state["remaining"] = 0
 
             await edit_progress(
@@ -842,10 +993,6 @@ async def cleanup_chat(
             )
 
             return
-
-        # ====================================================
-        # DELETE
-        # ====================================================
 
         state["status"] = "Deleting"
 
@@ -867,10 +1014,12 @@ async def cleanup_chat(
             if stop_event.is_set():
 
                 state["status"] = "Stopped"
+
                 break
 
             batch = duplicate_ids[
-                start:start + DELETE_BATCH_SIZE
+                start:start
+                + DELETE_BATCH_SIZE
             ]
 
             success = False
@@ -879,16 +1028,19 @@ async def cleanup_chat(
 
                 try:
 
-                    await telethon_client.delete_messages(
-                        entity,
-                        batch,
-                        revoke=True,
+                    await (
+                        telethon_client
+                        .delete_messages(
+                            entity,
+                            batch,
+                            revoke=True,
+                        )
                     )
 
                     success = True
 
-                    state["deleted"] += len(
-                        batch
+                    state["deleted"] += (
+                        len(batch)
                     )
 
                     state["remaining"] = (
@@ -916,7 +1068,9 @@ async def cleanup_chat(
                         e.seconds
                     )
 
-                    state["status"] = "Deleting"
+                    state["status"] = (
+                        "Deleting"
+                    )
 
                 except RPCError as e:
 
@@ -985,7 +1139,10 @@ async def cleanup_chat(
                 state_text(user_id)
                 + "\n\n"
                 + "❌ <b>Error:</b>\n"
-                + f"<code>{str(e)[:1000]}</code>",
+                + (
+                    f"<code>{str(e)[:1000]}"
+                    "</code>"
+                ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_menu(),
             )
@@ -1009,24 +1166,107 @@ async def cleanup_chat(
 
 
 # ============================================================
+# PIPE - ADMIN CHECK
+# ============================================================
+
+async def is_pipe_admin(
+    update: Update,
+) -> bool:
+
+    message = update.effective_message
+
+    if not message:
+        return False
+
+    chat = update.effective_chat
+
+    if not chat:
+        return False
+
+    if chat.type not in (
+        "group",
+        "supergroup",
+    ):
+        return False
+
+    # --------------------------------------------------------
+    # NORMAL ADMIN
+    # --------------------------------------------------------
+
+    user = update.effective_user
+
+    if user:
+
+        try:
+
+            member = await context_bot_get_member(
+                update,
+                user.id,
+            )
+
+            if member.status in (
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.OWNER,
+            ):
+
+                return True
+
+        except Exception as e:
+
+            logger.warning(
+                "Admin check failed: %s",
+                e,
+            )
+
+    # --------------------------------------------------------
+    # ANONYMOUS ADMIN
+    # --------------------------------------------------------
+    #
+    # Anonymous admin messages are sent on behalf of
+    # the group itself.
+    #
+    # We accept only when sender_chat is the same group.
+    # --------------------------------------------------------
+
+    sender_chat = message.sender_chat
+
+    if (
+        sender_chat
+        and sender_chat.id == chat.id
+    ):
+
+        return True
+
+    return False
+
+
+async def context_bot_get_member(
+    update: Update,
+    user_id: int,
+):
+
+    bot = update.get_bot()
+
+    return await bot.get_chat_member(
+        update.effective_chat.id,
+        user_id,
+    )
+
+
+# ============================================================
 # PIPE TASK
 # ============================================================
 
 async def pipe_chat(
-    user_id: int,
+    chat_id: int,
+    chat_name: str,
     log_message,
 ):
-
-    state = get_state(user_id)
-
-    chat_id = selected_chats.get(user_id)
-
-    if not chat_id:
-        return
 
     deleted = 0
     failed = 0
     total_seen = 0
+
     batch = []
 
     try:
@@ -1035,58 +1275,60 @@ async def pipe_chat(
             chat_id
         )
 
-        chat_name = state["chat_name"]
-
         await log_message.edit_text(
             "🧹 <b>PIPE STARTED</b>\n\n"
+            "━━━━━━━━━━━━━━\n"
             f"📌 Chat: <b>{chat_name}</b>\n"
-            f"🛡️ Keeping: <b>{PIPE_KEEP_MESSAGES}</b>\n\n"
-            "⏳ Finding old messages...",
+            f"🛡️ Keep: "
+            f"<b>{PIPE_KEEP_MESSAGES}</b>\n"
+            "━━━━━━━━━━━━━━\n\n"
+            "⏳ Processing...",
             parse_mode=ParseMode.HTML,
         )
 
-        # ====================================================
-        # IMPORTANT:
-        # reverse=False would start from oldest.
-        #
-        # We use reverse=True so the newest messages
-        # come first.
-        #
-        # First 20 = KEEP
-        # Everything after that = DELETE
-        # ====================================================
-
-        async for message in telethon_client.iter_messages(
-            entity,
-            reverse=False,
+        # newest -> oldest
+        async for message in (
+            telethon_client.iter_messages(
+                entity,
+                reverse=False,
+            )
         ):
 
             total_seen += 1
 
-            # Keep newest 20 messages.
-            if total_seen <= PIPE_KEEP_MESSAGES:
+            # Keep newest 20
+            if total_seen <= (
+                PIPE_KEEP_MESSAGES
+            ):
+
                 continue
 
-            batch.append(message.id)
+            batch.append(
+                message.id
+            )
 
-            if len(batch) < PIPE_DELETE_BATCH_SIZE:
+            if len(batch) < (
+                PIPE_DELETE_BATCH_SIZE
+            ):
+
                 continue
-
-            # ------------------------------------------------
-            # DELETE BATCH
-            # ------------------------------------------------
 
             while batch:
 
                 try:
 
-                    await telethon_client.delete_messages(
-                        entity,
-                        batch,
-                        revoke=True,
+                    await (
+                        telethon_client
+                        .delete_messages(
+                            entity,
+                            batch,
+                            revoke=True,
+                        )
                     )
 
-                    deleted += len(batch)
+                    deleted += len(
+                        batch
+                    )
 
                     batch.clear()
 
@@ -1094,8 +1336,10 @@ async def pipe_chat(
 
                     await log_message.edit_text(
                         "⏳ <b>PIPE WAITING</b>\n\n"
-                        f"📌 Chat: <b>{chat_name}</b>\n"
-                        f"🗑️ Deleted: <b>{deleted:,}</b>\n"
+                        f"📌 Chat: "
+                        f"<b>{chat_name}</b>\n"
+                        f"🗑️ Deleted: "
+                        f"<b>{deleted:,}</b>\n"
                         f"⏱️ Telegram wait: "
                         f"<b>{e.seconds}s</b>\n\n"
                         "Will continue automatically.",
@@ -1103,7 +1347,7 @@ async def pipe_chat(
                     )
 
                     logger.warning(
-                        "PIPE FloodWait: %s seconds",
+                        "PIPE FloodWait: %s",
                         e.seconds,
                     )
 
@@ -1113,7 +1357,9 @@ async def pipe_chat(
 
                 except RPCError as e:
 
-                    failed += len(batch)
+                    failed += len(
+                        batch
+                    )
 
                     logger.error(
                         "PIPE RPC error: %s",
@@ -1124,7 +1370,9 @@ async def pipe_chat(
 
                 except Exception as e:
 
-                    failed += len(batch)
+                    failed += len(
+                        batch
+                    )
 
                     logger.exception(
                         "PIPE delete error"
@@ -1136,84 +1384,77 @@ async def pipe_chat(
                 PIPE_DELETE_PAUSE
             )
 
-            # ------------------------------------------------
-            # UPDATE LOG
-            # ------------------------------------------------
-
-            try:
-
-                await log_message.edit_text(
-                    "🧹 <b>PIPE RUNNING</b>\n\n"
-                    f"📌 Chat: <b>{chat_name}</b>\n"
-                    f"📨 Processed: <b>{total_seen:,}</b>\n"
-                    f"🗑️ Deleted: <b>{deleted:,}</b>\n"
-                    f"❌ Failed: <b>{failed:,}</b>\n"
-                    f"🛡️ Keeping: <b>{PIPE_KEEP_MESSAGES}</b>\n\n"
-                    "⏳ Continuing...",
-                    parse_mode=ParseMode.HTML,
-                )
-
-            except Exception:
-                pass
-
-        # ====================================================
+        # ----------------------------------------------------
         # FINAL BATCH
-        # ====================================================
+        # ----------------------------------------------------
 
         if batch:
 
-            while batch:
+            try:
 
-                try:
-
-                    await telethon_client.delete_messages(
+                await (
+                    telethon_client
+                    .delete_messages(
                         entity,
                         batch,
                         revoke=True,
                     )
+                )
 
-                    deleted += len(batch)
+                deleted += len(
+                    batch
+                )
+
+                batch.clear()
+
+            except FloodWaitError as e:
+
+                await asyncio.sleep(
+                    e.seconds
+                )
+
+                try:
+
+                    await (
+                        telethon_client
+                        .delete_messages(
+                            entity,
+                            batch,
+                            revoke=True,
+                        )
+                    )
+
+                    deleted += len(
+                        batch
+                    )
 
                     batch.clear()
 
-                except FloodWaitError as e:
+                except Exception as retry_error:
 
-                    await log_message.edit_text(
-                        "⏳ <b>PIPE WAITING</b>\n\n"
-                        f"📌 Chat: <b>{chat_name}</b>\n"
-                        f"🗑️ Deleted: <b>{deleted:,}</b>\n"
-                        f"⏱️ Waiting: <b>{e.seconds}s</b>",
-                        parse_mode=ParseMode.HTML,
+                    failed += len(
+                        batch
                     )
-
-                    await asyncio.sleep(
-                        e.seconds
-                    )
-
-                except RPCError as e:
-
-                    failed += len(batch)
 
                     logger.error(
-                        "PIPE final RPC error: %s",
-                        e,
+                        "PIPE retry failed: %s",
+                        retry_error,
                     )
 
                     batch.clear()
 
-                except Exception as e:
+            except Exception as e:
 
-                    failed += len(batch)
+                failed += len(
+                    batch
+                )
 
-                    logger.exception(
-                        "PIPE final delete error"
-                    )
+                logger.error(
+                    "PIPE final error: %s",
+                    e,
+                )
 
-                    batch.clear()
-
-        # ====================================================
-        # FINAL REPORT
-        # ====================================================
+                batch.clear()
 
         kept = min(
             total_seen,
@@ -1224,13 +1465,16 @@ async def pipe_chat(
             "✅ <b>PIPE COMPLETED</b>\n\n"
             "━━━━━━━━━━━━━━\n"
             f"📌 Chat: <b>{chat_name}</b>\n"
-            f"📨 Found: <b>{total_seen:,}</b>\n"
-            f"🗑️ Deleted: <b>{deleted:,}</b>\n"
-            f"❌ Failed: <b>{failed:,}</b>\n"
-            f"🛡️ Kept: <b>{kept}</b>\n"
+            f"📨 Found: "
+            f"<b>{total_seen:,}</b>\n"
+            f"🗑️ Deleted: "
+            f"<b>{deleted:,}</b>\n"
+            f"❌ Failed: "
+            f"<b>{failed:,}</b>\n"
+            f"🛡️ Kept: "
+            f"<b>{kept}</b>\n"
             "━━━━━━━━━━━━━━\n\n"
-            "✅ Target chat cleaned.\n"
-            "📌 Last 20 messages were kept.",
+            "✅ Target chat cleaned.",
             parse_mode=ParseMode.HTML,
         )
 
@@ -1244,23 +1488,708 @@ async def pipe_chat(
 
             await log_message.edit_text(
                 "❌ <b>PIPE FAILED</b>\n\n"
-                f"📌 Chat: <b>{state['chat_name']}</b>\n"
-                f"📨 Processed: <b>{total_seen:,}</b>\n"
-                f"🗑️ Deleted: <b>{deleted:,}</b>\n"
-                f"❌ Failed: <b>{failed:,}</b>\n\n"
-                f"<code>{str(e)[:1000]}</code>",
+                f"📌 Chat: "
+                f"<b>{chat_name}</b>\n"
+                f"📨 Processed: "
+                f"<b>{total_seen:,}</b>\n"
+                f"🗑️ Deleted: "
+                f"<b>{deleted:,}</b>\n"
+                f"❌ Failed: "
+                f"<b>{failed:,}</b>\n\n"
+                f"<code>{str(e)[:1000]}"
+                "</code>",
                 parse_mode=ParseMode.HTML,
             )
 
         except Exception:
             pass
 
-    finally:
 
-        pipe_tasks.pop(
+# ============================================================
+# /PIPE
+# ============================================================
+
+async def pipe_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    message = update.effective_message
+    chat = update.effective_chat
+
+    if not message or not chat:
+        return
+
+    if chat.type not in (
+        "group",
+        "supergroup",
+    ):
+
+        await message.reply_text(
+            "❌ /pipe can only be used "
+            "inside an approved group."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # APPROVAL CHECK
+    # --------------------------------------------------------
+
+    approved = await is_group_approved(
+        chat.id
+    )
+
+    if not approved:
+
+        return
+
+    # --------------------------------------------------------
+    # ADMIN CHECK
+    # --------------------------------------------------------
+
+    if not await is_pipe_admin(
+        update
+    ):
+
+        return
+
+    # --------------------------------------------------------
+    # CHECK IF ALREADY RUNNING
+    # --------------------------------------------------------
+
+    task_key = chat.id
+
+    existing_task = pipe_tasks.get(
+        task_key
+    )
+
+    if (
+        existing_task
+        and not existing_task.done()
+    ):
+
+        return
+
+    chat_name = (
+        chat.title
+        or "Unknown Group"
+    )
+
+    # --------------------------------------------------------
+    # LOG GROUP
+    # --------------------------------------------------------
+
+    try:
+
+        log_message = await (
+            context.bot.send_message(
+                chat_id=PIPE_LOG_CHAT_ID,
+                text=(
+                    "🧹 <b>PIPE STARTED</b>\n\n"
+                    "━━━━━━━━━━━━━━\n"
+                    f"📌 Chat: "
+                    f"<b>{chat_name}</b>\n"
+                    f"🆔 <code>{chat.id}</code>\n"
+                    f"🛡️ Keep: "
+                    f"<b>{PIPE_KEEP_MESSAGES}</b>\n"
+                    "━━━━━━━━━━━━━━\n\n"
+                    "⏳ Processing..."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Could not send PIPE log"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # START
+    # --------------------------------------------------------
+
+    task = asyncio.create_task(
+        pipe_chat(
+            chat.id,
+            chat_name,
+            log_message,
+        )
+    )
+
+    pipe_tasks[task_key] = task
+
+    # IMPORTANT:
+    # Nothing is sent to the target group.
+
+
+# ============================================================
+# BOT ADDED / GROUP APPROVAL
+# ============================================================
+
+async def bot_membership_update(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    chat_member_update = (
+        update.my_chat_member
+    )
+
+    if not chat_member_update:
+        return
+
+    new_member = (
+        chat_member_update.new_chat_member
+    )
+
+    old_member = (
+        chat_member_update.old_chat_member
+    )
+
+    chat = chat_member_update.chat
+
+    if chat.type not in (
+        "group",
+        "supergroup",
+    ):
+        return
+
+    # --------------------------------------------------------
+    # BOT ADDED / PROMOTED
+    # --------------------------------------------------------
+
+    bot_is_member_now = (
+        new_member.status
+        in (
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+        )
+    )
+
+    bot_was_member = (
+        old_member.status
+        in (
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+        )
+    )
+
+    if (
+        bot_is_member_now
+        and not bot_was_member
+    ):
+
+        # Already approved?
+        if await is_group_approved(
+            chat.id
+        ):
+            return
+
+        title = (
+            chat.title
+            or "Unknown Group"
+        )
+
+        added_by = (
+            chat_member_update
+            .from_user
+        )
+
+        added_name = (
+            added_by.full_name
+            if added_by
+            else "Unknown"
+        )
+
+        pending_approvals[
+            chat.id
+        ] = {
+            "title": title,
+            "added_by": (
+                added_by.id
+                if added_by
+                else None
+            ),
+        }
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ APPROVE",
+                        callback_data=(
+                            f"approve_group:"
+                            f"{chat.id}"
+                        ),
+                    ),
+                    InlineKeyboardButton(
+                        "❌ REJECT",
+                        callback_data=(
+                            f"reject_group:"
+                            f"{chat.id}"
+                        ),
+                    ),
+                ]
+            ]
+        )
+
+        try:
+
+            await context.bot.send_message(
+                chat_id=PIPE_LOG_CHAT_ID,
+                text=(
+                    "🤖 <b>NEW GROUP ADDED</b>\n\n"
+                    "━━━━━━━━━━━━━━\n"
+                    f"📌 Group: "
+                    f"<b>{title}</b>\n"
+                    f"🆔 ID: "
+                    f"<code>{chat.id}</code>\n"
+                    f"👤 Added by: "
+                    f"<b>{added_name}</b>\n"
+                    "━━━━━━━━━━━━━━\n\n"
+                    "⚠️ This group is NOT approved yet.\n\n"
+                    "Approve this group?"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+
+        except Exception as e:
+
+            logger.exception(
+                "Failed to send approval request: %s",
+                e,
+            )
+
+
+# ============================================================
+# CALLBACK HANDLER
+# ============================================================
+
+async def callback_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    user = query.from_user
+
+    if not is_admin(
+        user.id
+    ):
+
+        await query.answer(
+            "❌ Not authorized.",
+            show_alert=True,
+        )
+
+        return
+
+    user_id = user.id
+
+    data = query.data
+
+    # ========================================================
+    # APPROVE GROUP
+    # ========================================================
+
+    if data.startswith(
+        "approve_group:"
+    ):
+
+        try:
+
+            chat_id = int(
+                data.split(
+                    ":",
+                    1,
+                )[1]
+            )
+
+        except ValueError:
+
+            return
+
+        pending = (
+            pending_approvals.get(
+                chat_id
+            )
+        )
+
+        if not pending:
+
+            await query.edit_message_text(
+                "⚠️ Approval request expired."
+            )
+
+            return
+
+        title = pending[
+            "title"
+        ]
+
+        await approve_group(
+            chat_id,
+            title,
+            user.id,
+        )
+
+        pending_approvals.pop(
+            chat_id,
+            None,
+        )
+
+        await query.edit_message_text(
+            "✅ <b>GROUP APPROVED</b>\n\n"
+            f"📌 Group: "
+            f"<b>{title}</b>\n"
+            f"🆔 <code>{chat_id}</code>\n\n"
+            "🟢 /pipe is now enabled "
+            "for admins of this group.",
+            parse_mode=ParseMode.HTML,
+        )
+
+        return
+
+    # ========================================================
+    # REJECT GROUP
+    # ========================================================
+
+    if data.startswith(
+        "reject_group:"
+    ):
+
+        try:
+
+            chat_id = int(
+                data.split(
+                    ":",
+                    1,
+                )[1]
+            )
+
+        except ValueError:
+
+            return
+
+        pending = (
+            pending_approvals.get(
+                chat_id
+            )
+        )
+
+        title = (
+            pending["title"]
+            if pending
+            else "Unknown Group"
+        )
+
+        await reject_group(
+            chat_id
+        )
+
+        pending_approvals.pop(
+            chat_id,
+            None,
+        )
+
+        await query.edit_message_text(
+            "❌ <b>GROUP REJECTED</b>\n\n"
+            f"📌 Group: "
+            f"<b>{title}</b>\n"
+            f"🆔 <code>{chat_id}</code>\n\n"
+            "🔴 This group is not approved.",
+            parse_mode=ParseMode.HTML,
+        )
+
+        return
+
+    # ========================================================
+    # HOME
+    # ========================================================
+
+    if data == "home":
+
+        state = get_state(
+            user_id
+        )
+
+        if user_id in selected_chats:
+
+            await query.edit_message_text(
+                "🧹 <b>DUPLICATE CLEANER</b>\n\n"
+                f"📌 Connected: "
+                f"<b>{state['chat_name']}</b>\n\n"
+                "Choose an option:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=selected_chat_menu(),
+            )
+
+        else:
+
+            await query.edit_message_text(
+                "🧹 <b>DUPLICATE CLEANER</b>\n\n"
+                "Choose an option:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu(),
+            )
+
+        return
+
+    # ========================================================
+    # CONNECT
+    # ========================================================
+
+    if data == "connect":
+
+        await show_chat_list(
+            query,
+            user_id,
+            0,
+        )
+
+        return
+
+    # ========================================================
+    # REFRESH
+    # ========================================================
+
+    if data == "refresh":
+
+        chat_cache.pop(
             user_id,
             None,
         )
+
+        await show_chat_list(
+            query,
+            user_id,
+            0,
+        )
+
+        return
+
+    # ========================================================
+    # PAGE
+    # ========================================================
+
+    if data.startswith(
+        "page:"
+    ):
+
+        try:
+
+            page = int(
+                data.split(
+                    ":",
+                    1,
+                )[1]
+            )
+
+        except ValueError:
+
+            page = 0
+
+        await show_chat_list(
+            query,
+            user_id,
+            page,
+        )
+
+        return
+
+    # ========================================================
+    # SELECT CHAT
+    # ========================================================
+
+    if data.startswith(
+        "select:"
+    ):
+
+        try:
+
+            index = int(
+                data.split(
+                    ":",
+                    1,
+                )[1]
+            )
+
+        except ValueError:
+
+            await query.edit_message_text(
+                "❌ Invalid selection.",
+                reply_markup=main_menu(),
+            )
+
+            return
+
+        chats = chat_cache.get(
+            user_id,
+            [],
+        )
+
+        if (
+            index < 0
+            or index >= len(chats)
+        ):
+
+            await query.edit_message_text(
+                "❌ Chat list expired.\n"
+                "Please refresh.",
+                reply_markup=main_menu(),
+            )
+
+            return
+
+        chat_id, title, chat_type = (
+            chats[index]
+        )
+
+        selected_chats[
+            user_id
+        ] = chat_id
+
+        state = get_state(
+            user_id
+        )
+
+        state["chat_name"] = title
+        state["status"] = "Connected"
+
+        await query.edit_message_text(
+            "✅ <b>CHAT CONNECTED</b>\n\n"
+            f"📌 <b>{title}</b>\n"
+            f"📂 {chat_type}\n\n"
+            "You can now scan the old history.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=selected_chat_menu(),
+        )
+
+        return
+
+    # ========================================================
+    # SCAN
+    # ========================================================
+
+    if data == "scan":
+
+        if user_id not in selected_chats:
+
+            await query.edit_message_text(
+                "❌ Please connect a chat first.",
+                reply_markup=main_menu(),
+            )
+
+            return
+
+        state = get_state(
+            user_id
+        )
+
+        if state["running"]:
+
+            await query.answer(
+                "A scan is already running.",
+                show_alert=True,
+            )
+
+            return
+
+        state["status"] = "Starting"
+
+        progress_message = (
+            query.message
+        )
+
+        task = asyncio.create_task(
+            cleanup_chat(
+                user_id,
+                progress_message,
+            )
+        )
+
+        running_tasks[
+            user_id
+        ] = task
+
+        await query.edit_message_text(
+            state_text(user_id),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🛑 Stop",
+                            callback_data="stop",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+        return
+
+    # ========================================================
+    # STATUS
+    # ========================================================
+
+    if data == "status":
+
+        await query.edit_message_text(
+            state_text(user_id),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu(),
+        )
+
+        return
+
+    # ========================================================
+    # STOP
+    # ========================================================
+
+    if data == "stop":
+
+        event = stop_events.get(
+            user_id
+        )
+
+        state = get_state(
+            user_id
+        )
+
+        if (
+            not state["running"]
+            or not event
+        ):
+
+            await query.edit_message_text(
+                "ℹ️ Nothing is running.",
+                reply_markup=main_menu(),
+            )
+
+            return
+
+        event.set()
+
+        state["status"] = (
+            "Stopping..."
+        )
+
+        await query.edit_message_text(
+            state_text(user_id),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu(),
+        )
+
+        return
 
 
 # ============================================================
@@ -1272,12 +2201,18 @@ async def start_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not await require_admin(update):
+    if not await require_admin(
+        update
+    ):
         return
 
-    user_id = update.effective_user.id
+    user_id = (
+        update.effective_user.id
+    )
 
-    state = get_state(user_id)
+    state = get_state(
+        user_id
+    )
 
     selected = selected_chats.get(
         user_id
@@ -1321,10 +2256,14 @@ async def status_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not await require_admin(update):
+    if not await require_admin(
+        update
+    ):
         return
 
-    user_id = update.effective_user.id
+    user_id = (
+        update.effective_user.id
+    )
 
     await update.message.reply_text(
         state_text(user_id),
@@ -1341,18 +2280,27 @@ async def stop_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not await require_admin(update):
+    if not await require_admin(
+        update
+    ):
         return
 
-    user_id = update.effective_user.id
+    user_id = (
+        update.effective_user.id
+    )
 
     event = stop_events.get(
         user_id
     )
 
-    state = get_state(user_id)
+    state = get_state(
+        user_id
+    )
 
-    if not state["running"] or not event:
+    if (
+        not state["running"]
+        or not event
+    ):
 
         await update.message.reply_text(
             "ℹ️ Nothing is running."
@@ -1362,390 +2310,14 @@ async def stop_command(
 
     event.set()
 
-    state["status"] = "Stopping..."
+    state["status"] = (
+        "Stopping..."
+    )
 
     await update.message.reply_text(
         "🛑 Stop requested.\n\n"
         "The current operation will stop safely."
     )
-
-
-# ============================================================
-# /PIPE
-# ============================================================
-
-async def pipe_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_admin(update):
-        return
-
-    user_id = update.effective_user.id
-
-    # --------------------------------------------------------
-    # CHAT MUST BE CONNECTED
-    # --------------------------------------------------------
-
-    if user_id not in selected_chats:
-
-        await update.message.reply_text(
-            "❌ Please connect a chat first."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # PREVENT TWO PIPE TASKS
-    # --------------------------------------------------------
-
-    if user_id in pipe_tasks:
-
-        await update.message.reply_text(
-            "⚠️ PIPE is already running."
-        )
-
-        return
-
-    state = get_state(user_id)
-
-    # --------------------------------------------------------
-    # LOG ONLY IN LOG GROUP
-    # --------------------------------------------------------
-
-    try:
-
-        log_message = await context.bot.send_message(
-            chat_id=PIPE_LOG_CHAT_ID,
-            text=(
-                "🧹 <b>PIPE STARTED</b>\n\n"
-                "━━━━━━━━━━━━━━\n"
-                f"📌 Chat: <b>{state['chat_name']}</b>\n"
-                f"🛡️ Keep: <b>{PIPE_KEEP_MESSAGES}</b>\n"
-                "━━━━━━━━━━━━━━\n\n"
-                "⏳ Processing..."
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-
-    except Exception as e:
-
-        logger.exception(
-            "Could not send PIPE log message"
-        )
-
-        await update.message.reply_text(
-            "❌ Could not start PIPE.\n\n"
-            "Please check PIPE_LOG_CHAT_ID "
-            "and make sure the bot is inside "
-            "the log group."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # START BACKGROUND TASK
-    # --------------------------------------------------------
-
-    task = asyncio.create_task(
-        pipe_chat(
-            user_id,
-            log_message,
-        )
-    )
-
-    pipe_tasks[user_id] = task
-
-    # --------------------------------------------------------
-    # IMPORTANT:
-    # NO REPORT IS SENT TO TARGET CHAT.
-    # --------------------------------------------------------
-
-
-# ============================================================
-# CALLBACK HANDLER
-# ============================================================
-
-async def callback_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    user = query.from_user
-
-    if not is_admin(user.id):
-
-        await query.answer(
-            "❌ Not authorized.",
-            show_alert=True,
-        )
-
-        return
-
-    user_id = user.id
-
-    data = query.data
-
-    # --------------------------------------------------------
-    # HOME
-    # --------------------------------------------------------
-
-    if data == "home":
-
-        state = get_state(user_id)
-
-        if user_id in selected_chats:
-
-            await query.edit_message_text(
-                "🧹 <b>DUPLICATE CLEANER</b>\n\n"
-                f"📌 Connected: "
-                f"<b>{state['chat_name']}</b>\n\n"
-                "Choose an option:",
-                parse_mode=ParseMode.HTML,
-                reply_markup=selected_chat_menu(),
-            )
-
-        else:
-
-            await query.edit_message_text(
-                "🧹 <b>DUPLICATE CLEANER</b>\n\n"
-                "Choose an option:",
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_menu(),
-            )
-
-        return
-
-    # --------------------------------------------------------
-    # CONNECT
-    # --------------------------------------------------------
-
-    if data == "connect":
-
-        await show_chat_list(
-            query,
-            user_id,
-            0,
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # REFRESH
-    # --------------------------------------------------------
-
-    if data == "refresh":
-
-        chat_cache.pop(
-            user_id,
-            None,
-        )
-
-        await show_chat_list(
-            query,
-            user_id,
-            0,
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # PAGE
-    # --------------------------------------------------------
-
-    if data.startswith("page:"):
-
-        try:
-
-            page = int(
-                data.split(":", 1)[1]
-            )
-
-        except ValueError:
-
-            page = 0
-
-        await show_chat_list(
-            query,
-            user_id,
-            page,
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # SELECT CHAT
-    # --------------------------------------------------------
-
-    if data.startswith("select:"):
-
-        try:
-
-            index = int(
-                data.split(":", 1)[1]
-            )
-
-        except ValueError:
-
-            await query.edit_message_text(
-                "❌ Invalid selection.",
-                reply_markup=main_menu(),
-            )
-
-            return
-
-        chats = chat_cache.get(
-            user_id,
-            [],
-        )
-
-        if (
-            index < 0
-            or index >= len(chats)
-        ):
-
-            await query.edit_message_text(
-                "❌ Chat list expired.\n"
-                "Please refresh.",
-                reply_markup=main_menu(),
-            )
-
-            return
-
-        chat_id, title, chat_type = (
-            chats[index]
-        )
-
-        selected_chats[user_id] = (
-            chat_id
-        )
-
-        state = get_state(user_id)
-
-        state["chat_name"] = title
-        state["status"] = "Connected"
-
-        await query.edit_message_text(
-            "✅ <b>CHAT CONNECTED</b>\n\n"
-            f"📌 <b>{title}</b>\n"
-            f"📂 {chat_type}\n\n"
-            "You can now scan the old history.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=selected_chat_menu(),
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # SCAN
-    # --------------------------------------------------------
-
-    if data == "scan":
-
-        if user_id not in selected_chats:
-
-            await query.edit_message_text(
-                "❌ Please connect a chat first.",
-                reply_markup=main_menu(),
-            )
-
-            return
-
-        state = get_state(user_id)
-
-        if state["running"]:
-
-            await query.answer(
-                "A scan is already running.",
-                show_alert=True,
-            )
-
-            return
-
-        state["status"] = "Starting"
-
-        progress_message = query.message
-
-        task = asyncio.create_task(
-            cleanup_chat(
-                user_id,
-                progress_message,
-            )
-        )
-
-        running_tasks[user_id] = task
-
-        await query.edit_message_text(
-            state_text(user_id),
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "🛑 Stop",
-                            callback_data="stop",
-                        )
-                    ]
-                ]
-            ),
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # STATUS
-    # --------------------------------------------------------
-
-    if data == "status":
-
-        await query.edit_message_text(
-            state_text(user_id),
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_menu(),
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # STOP
-    # --------------------------------------------------------
-
-    if data == "stop":
-
-        event = stop_events.get(
-            user_id
-        )
-
-        state = get_state(user_id)
-
-        if (
-            not state["running"]
-            or not event
-        ):
-
-            await query.edit_message_text(
-                "ℹ️ Nothing is running.",
-                reply_markup=main_menu(),
-            )
-
-            return
-
-        event.set()
-
-        state["status"] = "Stopping..."
-
-        await query.edit_message_text(
-            state_text(user_id),
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_menu(),
-        )
-
-        return
 
 
 # ============================================================
@@ -1794,6 +2366,17 @@ async def post_shutdown(
             e,
         )
 
+    try:
+
+        mongo_client.close()
+
+    except Exception as e:
+
+        logger.warning(
+            "Mongo disconnect error: %s",
+            e,
+        )
+
 
 # ============================================================
 # MAIN
@@ -1830,14 +2413,21 @@ def main():
         )
     )
 
-    # ========================================================
-    # PIPE COMMAND
-    # ========================================================
-
     application.add_handler(
         CommandHandler(
             "pipe",
             pipe_command,
+        )
+    )
+
+    # --------------------------------------------------------
+    # BOT ADDED TO GROUP
+    # --------------------------------------------------------
+
+    application.add_handler(
+        ChatMemberHandler(
+            bot_membership_update,
+            ChatMemberHandler.MY_CHAT_MEMBER,
         )
     )
 
@@ -1855,6 +2445,7 @@ def main():
         allowed_updates=[
             "message",
             "callback_query",
+            "my_chat_member",
         ]
     )
 
