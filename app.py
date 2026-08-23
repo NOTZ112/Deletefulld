@@ -1,9 +1,8 @@
 import os
 import asyncio
 import logging
-from typing import Optional
 
-from telethon import TelegramClient
+from telethon import TelegramClient, functions
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError
 
@@ -20,7 +19,9 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     ChatMemberHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 
@@ -82,11 +83,18 @@ if not MONGO_URI:
     raise RuntimeError("MONGO_URI is missing")
 
 
-API_ID = int(API_ID_RAW)
+try:
+    API_ID = int(API_ID_RAW)
+except ValueError:
+    raise RuntimeError("API_ID must be a number")
 
-LOG_CHAT_ID = int(
-    PIPE_LOG_CHAT_ID_RAW
-)
+
+try:
+    LOG_CHAT_ID = int(PIPE_LOG_CHAT_ID_RAW)
+except ValueError:
+    raise RuntimeError(
+        "PIPE_LOG_CHAT_ID must be a valid integer"
+    )
 
 
 # ============================================================
@@ -124,19 +132,14 @@ ADMIN_IDS = parse_admin_ids(
 # WIPE SETTINGS
 # ============================================================
 
-# Automatic WIPE threshold
 WIPE_THRESHOLD = 1500
 
-# Latest messages to keep
 WIPE_KEEP_MESSAGES = 50
 
-# Delete batch
 WIPE_BATCH_SIZE = 100
 
-# Small pause between batches
 WIPE_PAUSE = 0.05
 
-# Progress update interval
 WIPE_PROGRESS_EVERY = 500
 
 
@@ -338,9 +341,7 @@ async def count_messages(
     try:
 
         result = await telethon_client(
-            __import__(
-                "telethon"
-            ).functions.messages.GetHistoryRequest(
+            functions.messages.GetHistoryRequest(
                 peer=entity,
                 offset_id=0,
                 offset_date=None,
@@ -367,7 +368,6 @@ async def count_messages(
             e,
         )
 
-        # Fallback
         count = 0
 
         async for _ in telethon_client.iter_messages(
@@ -388,9 +388,9 @@ async def get_message_count(
     entity,
 ) -> int:
 
-    try:
+    await ensure_telethon_connected()
 
-        from telethon import functions
+    try:
 
         result = await telethon_client(
             functions.messages.GetHistoryRequest(
@@ -478,8 +478,6 @@ async def wipe_chat(
 
     async with lock:
 
-        entity = None
-
         found = 0
         deleted = 0
         failed = 0
@@ -518,7 +516,7 @@ async def wipe_chat(
             )
 
             # ------------------------------------------------
-            # GET TOTAL
+            # TOTAL
             # ------------------------------------------------
 
             total = await get_message_count(
@@ -553,32 +551,36 @@ async def wipe_chat(
 
                 if progress_message:
 
-                    await progress_message.edit_text(
-                        text,
-                        parse_mode=ParseMode.HTML,
-                    )
+                    try:
+
+                        await progress_message.edit_text(
+                            text,
+                            parse_mode=ParseMode.HTML,
+                        )
+
+                    except Exception:
+                        pass
 
                 return
 
             # ------------------------------------------------
-            # OLD MESSAGE IDS
+            # DELETE IDS
             # ------------------------------------------------
 
             delete_ids = []
 
             seen = 0
 
-            # newest -> oldest
             async for message in telethon_client.iter_messages(
                 entity,
                 reverse=False,
             ):
 
                 seen += 1
+                found = seen
 
-                # Keep newest 50
+                # Keep newest messages
                 if seen <= WIPE_KEEP_MESSAGES:
-
                     continue
 
                 delete_ids.append(
@@ -661,7 +663,8 @@ async def wipe_chat(
                         except Exception as e:
 
                             logger.exception(
-                                "WIPE delete error"
+                                "WIPE delete error: %s",
+                                e,
                             )
 
                             failed += len(
@@ -677,9 +680,7 @@ async def wipe_chat(
                     if progress_message:
 
                         if (
-                            deleted
-                            % WIPE_PROGRESS_EVERY
-                            == 0
+                            deleted % WIPE_PROGRESS_EVERY == 0
                             or deleted == 0
                         ):
 
@@ -764,7 +765,8 @@ async def wipe_chat(
                     except Exception as e:
 
                         logger.exception(
-                            "Final delete error"
+                            "Final delete error: %s",
+                            e,
                         )
 
                         failed += len(
@@ -879,7 +881,10 @@ async def start_command(
     ):
         return
 
-    await update.message.reply_text(
+    if not update.effective_message:
+        return
+
+    await update.effective_message.reply_text(
         "🧹 <b>WIPE BOT</b>\n\n"
         "━━━━━━━━━━━━━━\n"
         f"🛡️ Keep: "
@@ -1052,10 +1057,6 @@ async def is_group_admin(
     ):
         return False
 
-    # --------------------------------------------------------
-    # NORMAL ADMIN
-    # --------------------------------------------------------
-
     user = update.effective_user
 
     if user:
@@ -1080,10 +1081,6 @@ async def is_group_admin(
                 "Group admin check failed: %s",
                 e,
             )
-
-    # --------------------------------------------------------
-    # ANONYMOUS ADMIN
-    # --------------------------------------------------------
 
     sender_chat = message.sender_chat
 
@@ -1128,13 +1125,17 @@ async def automatic_wipe_check(
         return
 
     # --------------------------------------------------------
-    # ONLY MEDIA / NORMAL MESSAGES
+    # COUNT
     # --------------------------------------------------------
 
     try:
 
+        entity = await get_entity(
+            chat.id
+        )
+
         total = await get_message_count(
-            await get_entity(chat.id)
+            entity
         )
 
     except Exception as e:
@@ -1364,6 +1365,7 @@ async def callback_handler(
             )
 
         except ValueError:
+
             return
 
         pending = pending_approvals.get(
@@ -1422,6 +1424,7 @@ async def callback_handler(
             )
 
         except ValueError:
+
             return
 
         pending = pending_approvals.get(
@@ -1565,16 +1568,16 @@ def main():
     # --------------------------------------------------------
 
     application.add_handler(
-        __import__(
-            "telegram.ext"
-        ).MessageHandler(
-            __import__(
-                "telegram.ext"
-            ).filters.ALL,
+        MessageHandler(
+            filters.ALL,
             automatic_wipe_check,
         ),
         group=10,
     )
+
+    # --------------------------------------------------------
+    # START
+    # --------------------------------------------------------
 
     logger.info(
         "WIPE BOT STARTED"
@@ -1604,5 +1607,4 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-
     main()
