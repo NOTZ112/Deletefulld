@@ -43,6 +43,12 @@ API_HASH = os.getenv("API_HASH", "").strip()
 STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
 
+# PIPE LOG GROUP
+PIPE_LOG_CHAT_ID_RAW = os.getenv(
+    "PIPE_LOG_CHAT_ID",
+    ""
+).strip()
+
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -56,8 +62,12 @@ if not API_HASH:
 if not STRING_SESSION:
     raise RuntimeError("STRING_SESSION is missing")
 
+if not PIPE_LOG_CHAT_ID_RAW:
+    raise RuntimeError("PIPE_LOG_CHAT_ID is missing")
+
 
 API_ID = int(API_ID_RAW)
+PIPE_LOG_CHAT_ID = int(PIPE_LOG_CHAT_ID_RAW)
 
 
 # ============================================================
@@ -112,8 +122,19 @@ PROGRESS_SCAN_EVERY = 500
 
 PROGRESS_DELETE_EVERY = 100
 
-# Small pause between delete batches.
+# Small pause between duplicate delete batches.
 DELETE_PAUSE = 0.20
+
+
+# ============================================================
+# PIPE SETTINGS
+# ============================================================
+
+PIPE_KEEP_MESSAGES = 20
+
+PIPE_DELETE_BATCH_SIZE = 100
+
+PIPE_DELETE_PAUSE = 0.20
 
 
 # ============================================================
@@ -136,6 +157,9 @@ stop_events: Dict[int, asyncio.Event] = {}
 progress_messages: Dict[int, object] = {}
 
 states: Dict[int, dict] = {}
+
+# PIPE TASKS
+pipe_tasks: Dict[int, asyncio.Task] = {}
 
 
 # ============================================================
@@ -985,6 +1009,261 @@ async def cleanup_chat(
 
 
 # ============================================================
+# PIPE TASK
+# ============================================================
+
+async def pipe_chat(
+    user_id: int,
+    log_message,
+):
+
+    state = get_state(user_id)
+
+    chat_id = selected_chats.get(user_id)
+
+    if not chat_id:
+        return
+
+    deleted = 0
+    failed = 0
+    total_seen = 0
+    batch = []
+
+    try:
+
+        entity = await get_entity_from_chat_id(
+            chat_id
+        )
+
+        chat_name = state["chat_name"]
+
+        await log_message.edit_text(
+            "🧹 <b>PIPE STARTED</b>\n\n"
+            f"📌 Chat: <b>{chat_name}</b>\n"
+            f"🛡️ Keeping: <b>{PIPE_KEEP_MESSAGES}</b>\n\n"
+            "⏳ Finding old messages...",
+            parse_mode=ParseMode.HTML,
+        )
+
+        # ====================================================
+        # IMPORTANT:
+        # reverse=False would start from oldest.
+        #
+        # We use reverse=True so the newest messages
+        # come first.
+        #
+        # First 20 = KEEP
+        # Everything after that = DELETE
+        # ====================================================
+
+        async for message in telethon_client.iter_messages(
+            entity,
+            reverse=False,
+        ):
+
+            total_seen += 1
+
+            # Keep newest 20 messages.
+            if total_seen <= PIPE_KEEP_MESSAGES:
+                continue
+
+            batch.append(message.id)
+
+            if len(batch) < PIPE_DELETE_BATCH_SIZE:
+                continue
+
+            # ------------------------------------------------
+            # DELETE BATCH
+            # ------------------------------------------------
+
+            while batch:
+
+                try:
+
+                    await telethon_client.delete_messages(
+                        entity,
+                        batch,
+                        revoke=True,
+                    )
+
+                    deleted += len(batch)
+
+                    batch.clear()
+
+                except FloodWaitError as e:
+
+                    await log_message.edit_text(
+                        "⏳ <b>PIPE WAITING</b>\n\n"
+                        f"📌 Chat: <b>{chat_name}</b>\n"
+                        f"🗑️ Deleted: <b>{deleted:,}</b>\n"
+                        f"⏱️ Telegram wait: "
+                        f"<b>{e.seconds}s</b>\n\n"
+                        "Will continue automatically.",
+                        parse_mode=ParseMode.HTML,
+                    )
+
+                    logger.warning(
+                        "PIPE FloodWait: %s seconds",
+                        e.seconds,
+                    )
+
+                    await asyncio.sleep(
+                        e.seconds
+                    )
+
+                except RPCError as e:
+
+                    failed += len(batch)
+
+                    logger.error(
+                        "PIPE RPC error: %s",
+                        e,
+                    )
+
+                    batch.clear()
+
+                except Exception as e:
+
+                    failed += len(batch)
+
+                    logger.exception(
+                        "PIPE delete error"
+                    )
+
+                    batch.clear()
+
+            await asyncio.sleep(
+                PIPE_DELETE_PAUSE
+            )
+
+            # ------------------------------------------------
+            # UPDATE LOG
+            # ------------------------------------------------
+
+            try:
+
+                await log_message.edit_text(
+                    "🧹 <b>PIPE RUNNING</b>\n\n"
+                    f"📌 Chat: <b>{chat_name}</b>\n"
+                    f"📨 Processed: <b>{total_seen:,}</b>\n"
+                    f"🗑️ Deleted: <b>{deleted:,}</b>\n"
+                    f"❌ Failed: <b>{failed:,}</b>\n"
+                    f"🛡️ Keeping: <b>{PIPE_KEEP_MESSAGES}</b>\n\n"
+                    "⏳ Continuing...",
+                    parse_mode=ParseMode.HTML,
+                )
+
+            except Exception:
+                pass
+
+        # ====================================================
+        # FINAL BATCH
+        # ====================================================
+
+        if batch:
+
+            while batch:
+
+                try:
+
+                    await telethon_client.delete_messages(
+                        entity,
+                        batch,
+                        revoke=True,
+                    )
+
+                    deleted += len(batch)
+
+                    batch.clear()
+
+                except FloodWaitError as e:
+
+                    await log_message.edit_text(
+                        "⏳ <b>PIPE WAITING</b>\n\n"
+                        f"📌 Chat: <b>{chat_name}</b>\n"
+                        f"🗑️ Deleted: <b>{deleted:,}</b>\n"
+                        f"⏱️ Waiting: <b>{e.seconds}s</b>",
+                        parse_mode=ParseMode.HTML,
+                    )
+
+                    await asyncio.sleep(
+                        e.seconds
+                    )
+
+                except RPCError as e:
+
+                    failed += len(batch)
+
+                    logger.error(
+                        "PIPE final RPC error: %s",
+                        e,
+                    )
+
+                    batch.clear()
+
+                except Exception as e:
+
+                    failed += len(batch)
+
+                    logger.exception(
+                        "PIPE final delete error"
+                    )
+
+                    batch.clear()
+
+        # ====================================================
+        # FINAL REPORT
+        # ====================================================
+
+        kept = min(
+            total_seen,
+            PIPE_KEEP_MESSAGES,
+        )
+
+        await log_message.edit_text(
+            "✅ <b>PIPE COMPLETED</b>\n\n"
+            "━━━━━━━━━━━━━━\n"
+            f"📌 Chat: <b>{chat_name}</b>\n"
+            f"📨 Found: <b>{total_seen:,}</b>\n"
+            f"🗑️ Deleted: <b>{deleted:,}</b>\n"
+            f"❌ Failed: <b>{failed:,}</b>\n"
+            f"🛡️ Kept: <b>{kept}</b>\n"
+            "━━━━━━━━━━━━━━\n\n"
+            "✅ Target chat cleaned.\n"
+            "📌 Last 20 messages were kept.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "PIPE failed"
+        )
+
+        try:
+
+            await log_message.edit_text(
+                "❌ <b>PIPE FAILED</b>\n\n"
+                f"📌 Chat: <b>{state['chat_name']}</b>\n"
+                f"📨 Processed: <b>{total_seen:,}</b>\n"
+                f"🗑️ Deleted: <b>{deleted:,}</b>\n"
+                f"❌ Failed: <b>{failed:,}</b>\n\n"
+                f"<code>{str(e)[:1000]}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        except Exception:
+            pass
+
+    finally:
+
+        pipe_tasks.pop(
+            user_id,
+            None,
+        )
+
+
+# ============================================================
 # /START
 # ============================================================
 
@@ -1089,6 +1368,99 @@ async def stop_command(
         "🛑 Stop requested.\n\n"
         "The current operation will stop safely."
     )
+
+
+# ============================================================
+# /PIPE
+# ============================================================
+
+async def pipe_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not await require_admin(update):
+        return
+
+    user_id = update.effective_user.id
+
+    # --------------------------------------------------------
+    # CHAT MUST BE CONNECTED
+    # --------------------------------------------------------
+
+    if user_id not in selected_chats:
+
+        await update.message.reply_text(
+            "❌ Please connect a chat first."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # PREVENT TWO PIPE TASKS
+    # --------------------------------------------------------
+
+    if user_id in pipe_tasks:
+
+        await update.message.reply_text(
+            "⚠️ PIPE is already running."
+        )
+
+        return
+
+    state = get_state(user_id)
+
+    # --------------------------------------------------------
+    # LOG ONLY IN LOG GROUP
+    # --------------------------------------------------------
+
+    try:
+
+        log_message = await context.bot.send_message(
+            chat_id=PIPE_LOG_CHAT_ID,
+            text=(
+                "🧹 <b>PIPE STARTED</b>\n\n"
+                "━━━━━━━━━━━━━━\n"
+                f"📌 Chat: <b>{state['chat_name']}</b>\n"
+                f"🛡️ Keep: <b>{PIPE_KEEP_MESSAGES}</b>\n"
+                "━━━━━━━━━━━━━━\n\n"
+                "⏳ Processing..."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Could not send PIPE log message"
+        )
+
+        await update.message.reply_text(
+            "❌ Could not start PIPE.\n\n"
+            "Please check PIPE_LOG_CHAT_ID "
+            "and make sure the bot is inside "
+            "the log group."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # START BACKGROUND TASK
+    # --------------------------------------------------------
+
+    task = asyncio.create_task(
+        pipe_chat(
+            user_id,
+            log_message,
+        )
+    )
+
+    pipe_tasks[user_id] = task
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # NO REPORT IS SENT TO TARGET CHAT.
+    # --------------------------------------------------------
 
 
 # ============================================================
@@ -1455,6 +1827,17 @@ def main():
         CommandHandler(
             "stop",
             stop_command,
+        )
+    )
+
+    # ========================================================
+    # PIPE COMMAND
+    # ========================================================
+
+    application.add_handler(
+        CommandHandler(
+            "pipe",
+            pipe_command,
         )
     )
 
