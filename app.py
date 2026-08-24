@@ -1,73 +1,63 @@
 import os
 import asyncio
 import logging
+from typing import Dict, Set
 
-from telethon import TelegramClient, functions
+from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError
 
-from motor.motor_asyncio import AsyncIOMotorClient
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     ChatMemberHandler,
-    MessageHandler,
     ContextTypes,
-    filters,
 )
 
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    level=logging.INFO,
-)
-
-logger = logging.getLogger("wipe-bot")
+from motor.motor_asyncio import AsyncIOMotorClient
 
 
 # ============================================================
-# ENV
+# CONFIG
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-API_ID_RAW = os.getenv("API_ID", "").strip()
+API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
+MONGO_URI = os.getenv("MONGO_URI", "").strip()
 
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().lstrip("-").isdigit()
+}
 
-PIPE_LOG_CHAT_ID_RAW = os.getenv(
-    "PIPE_LOG_CHAT_ID",
-    "",
-).strip()
+LOG_CHAT_ID = int(
+    os.getenv("PIPE_LOG_CHAT_ID", "0")
+)
 
-MONGO_URI = os.getenv(
-    "MONGO_URI",
-    "",
-).strip()
+# Wipe settings
+AUTO_WIPE_LIMIT = 1500
+WIPE_KEEP = 50
+
+# Speed / Telegram safety
+DELETE_BATCH = 100
+PROGRESS_EVERY = 500
+DELETE_PAUSE = 0.05
 
 
 # ============================================================
-# REQUIRED ENV CHECK
+# VALIDATION
 # ============================================================
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
 
-if not API_ID_RAW:
+if not API_ID:
     raise RuntimeError("API_ID is missing")
 
 if not API_HASH:
@@ -76,95 +66,41 @@ if not API_HASH:
 if not STRING_SESSION:
     raise RuntimeError("STRING_SESSION is missing")
 
-if not PIPE_LOG_CHAT_ID_RAW:
-    raise RuntimeError("PIPE_LOG_CHAT_ID is missing")
-
 if not MONGO_URI:
     raise RuntimeError("MONGO_URI is missing")
 
-
-try:
-    API_ID = int(API_ID_RAW)
-except ValueError:
-    raise RuntimeError("API_ID must be a number")
-
-
-try:
-    LOG_CHAT_ID = int(PIPE_LOG_CHAT_ID_RAW)
-except ValueError:
-    raise RuntimeError(
-        "PIPE_LOG_CHAT_ID must be a valid integer"
-    )
+if not LOG_CHAT_ID:
+    raise RuntimeError("PIPE_LOG_CHAT_ID is missing")
 
 
 # ============================================================
-# ADMIN IDS
+# LOGGING
 # ============================================================
 
-def parse_admin_ids(value: str) -> set[int]:
-
-    result = set()
-
-    for item in value.split(","):
-
-        item = item.strip()
-
-        if not item:
-            continue
-
-        try:
-            result.add(int(item))
-        except ValueError:
-            logger.warning(
-                "Invalid ADMIN_IDS value: %s",
-                item,
-            )
-
-    return result
-
-
-ADMIN_IDS = parse_admin_ids(
-    ADMIN_IDS_RAW
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
 )
 
-
-# ============================================================
-# WIPE SETTINGS
-# ============================================================
-
-WIPE_THRESHOLD = 1500
-
-WIPE_KEEP_MESSAGES = 50
-
-WIPE_BATCH_SIZE = 100
-
-WIPE_PAUSE = 0.05
-
-WIPE_PROGRESS_EVERY = 500
+logger = logging.getLogger("wipe-duplicate-bot")
 
 
 # ============================================================
-# MONGODB
+# MONGO
 # ============================================================
 
-mongo_client = AsyncIOMotorClient(
-    MONGO_URI
-)
+mongo = AsyncIOMotorClient(MONGO_URI)
 
-db = mongo_client[
-    "duplicate_cleaner"
-]
+db = mongo["duplicate_cleaner"]
 
-approved_groups = db[
-    "approved_groups"
-]
+approved_groups = db["approved_groups"]
 
 
 # ============================================================
 # TELETHON
 # ============================================================
 
-telethon_client = TelegramClient(
+tg = TelegramClient(
     StringSession(STRING_SESSION),
     API_ID,
     API_HASH,
@@ -172,121 +108,71 @@ telethon_client = TelegramClient(
 
 
 # ============================================================
-# GLOBAL STATE
+# RUNTIME STATE
 # ============================================================
 
-wipe_tasks: dict[int, asyncio.Task] = {}
+dclean_tasks: Dict[int, asyncio.Task] = {}
+wipe_tasks: Dict[int, asyncio.Task] = {}
 
-wipe_locks: dict[int, asyncio.Lock] = {}
+auto_wipe_locks: Dict[int, asyncio.Lock] = {}
 
-pending_approvals: dict[int, dict] = {}
-
-
-# ============================================================
-# LOCK
-# ============================================================
-
-def get_wipe_lock(
-    chat_id: int,
-) -> asyncio.Lock:
-
-    if chat_id not in wipe_locks:
-        wipe_locks[chat_id] = asyncio.Lock()
-
-    return wipe_locks[chat_id]
+pending_approvals: Dict[int, dict] = {}
 
 
 # ============================================================
-# ADMIN CHECK
+# TELETHON CONNECT
 # ============================================================
 
-def is_admin(
-    user_id: int,
-) -> bool:
+async def ensure_tg():
 
-    return user_id in ADMIN_IDS
+    if not tg.is_connected():
+        await tg.connect()
 
-
-async def require_bot_admin(
-    update: Update,
-) -> bool:
-
-    user = update.effective_user
-
-    if not user:
-        return False
-
-    if is_admin(user.id):
-        return True
-
-    if update.callback_query:
-
-        try:
-            await update.callback_query.answer(
-                "❌ Not authorized.",
-                show_alert=True,
-            )
-        except Exception:
-            pass
-
-    elif update.effective_message:
-
-        await update.effective_message.reply_text(
-            "❌ You are not authorized."
+    if not await tg.is_user_authorized():
+        raise RuntimeError(
+            "STRING_SESSION is not authorized"
         )
 
-    return False
-
 
 # ============================================================
-# APPROVED GROUP
+# APPROVAL
 # ============================================================
 
-async def is_group_approved(
-    chat_id: int,
-) -> bool:
+async def is_approved(chat_id: int) -> bool:
 
-    document = await approved_groups.find_one(
+    row = await approved_groups.find_one(
         {
             "_id": int(chat_id),
             "approved": True,
         }
     )
 
-    return document is not None
+    return row is not None
 
 
-async def approve_group(
+async def save_approval(
     chat_id: int,
     title: str,
-    approved_by: int,
+    admin_id: int,
 ):
 
     await approved_groups.update_one(
-        {
-            "_id": int(chat_id),
-        },
+        {"_id": int(chat_id)},
         {
             "$set": {
                 "title": title,
                 "approved": True,
-                "approved_by": int(
-                    approved_by
-                ),
+                "approved_by": int(admin_id),
             }
         },
         upsert=True,
     )
 
 
-async def reject_group(
-    chat_id: int,
-):
+async def reject_approval(chat_id: int):
 
     await approved_groups.update_one(
-        {
-            "_id": int(chat_id),
-        },
+        {"_id": int(chat_id)},
         {
             "$set": {
                 "approved": False,
@@ -297,605 +183,643 @@ async def reject_group(
 
 
 # ============================================================
-# TELETHON CONNECT
+# BOT ADMIN
 # ============================================================
 
-async def ensure_telethon_connected():
-
-    if not telethon_client.is_connected():
-
-        await telethon_client.connect()
-
-    if not await telethon_client.is_user_authorized():
-
-        raise RuntimeError(
-            "STRING_SESSION is not authorized."
-        )
+def is_bot_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 
 # ============================================================
-# GET ENTITY
+# LOG
 # ============================================================
 
-async def get_entity(
-    chat_id: int,
-):
-
-    await ensure_telethon_connected()
-
-    return await telethon_client.get_entity(
-        int(chat_id)
-    )
-
-
-# ============================================================
-# COUNT MESSAGES
-# ============================================================
-
-async def count_messages(
-    entity,
-) -> int:
-
-    await ensure_telethon_connected()
-
-    try:
-
-        result = await telethon_client(
-            functions.messages.GetHistoryRequest(
-                peer=entity,
-                offset_id=0,
-                offset_date=None,
-                add_offset=0,
-                limit=0,
-                max_id=0,
-                min_id=0,
-                hash=0,
-            )
-        )
-
-        return int(
-            getattr(
-                result,
-                "count",
-                0,
-            )
-        )
-
-    except Exception as e:
-
-        logger.warning(
-            "Count request failed: %s",
-            e,
-        )
-
-        count = 0
-
-        async for _ in telethon_client.iter_messages(
-            entity,
-            limit=None,
-        ):
-
-            count += 1
-
-        return count
-
-
-# ============================================================
-# FAST MESSAGE COUNT
-# ============================================================
-
-async def get_message_count(
-    entity,
-) -> int:
-
-    await ensure_telethon_connected()
-
-    try:
-
-        result = await telethon_client(
-            functions.messages.GetHistoryRequest(
-                peer=entity,
-                offset_id=0,
-                offset_date=None,
-                add_offset=0,
-                limit=1,
-                max_id=0,
-                min_id=0,
-                hash=0,
-            )
-        )
-
-        return int(
-            getattr(
-                result,
-                "count",
-                0,
-            )
-        )
-
-    except Exception as e:
-
-        logger.warning(
-            "Fast count failed: %s",
-            e,
-        )
-
-        return 0
-
-
-# ============================================================
-# LOG MESSAGE
-# ============================================================
-
-async def send_log(
+async def log_send(
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
     reply_markup=None,
 ):
 
+    return await context.bot.send_message(
+        chat_id=LOG_CHAT_ID,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=reply_markup,
+    )
+
+
+async def log_edit(
+    message,
+    text: str,
+):
+
+    try:
+        await message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.debug(
+            "Log edit failed: %s",
+            e,
+        )
+
+
+# ============================================================
+# GET TARGET ENTITY
+# ============================================================
+
+async def get_entity(chat_id: int):
+
+    await ensure_tg()
+
+    return await tg.get_entity(chat_id)
+
+
+# ============================================================
+# MEDIA UNIQUE KEY
+# ============================================================
+
+def media_key(message):
+
+    # Telegram document
+    document = getattr(
+        message,
+        "document",
+        None,
+    )
+
+    if document:
+
+        # Telegram's stable file identity
+        file_unique_id = getattr(
+            document,
+            "file_unique_id",
+            None,
+        )
+
+        if file_unique_id:
+            return (
+                "document",
+                str(file_unique_id),
+            )
+
+        # fallback
+        return (
+            "document",
+            int(document.id),
+        )
+
+    # Telegram photo
+    photo = getattr(
+        message,
+        "photo",
+        None,
+    )
+
+    if photo:
+
+        # Photo id is used as fallback identity
+        return (
+            "photo",
+            int(photo.id),
+        )
+
+    return None
+
+
+# ============================================================
+# D CLEAN
+# ============================================================
+
+async def dclean_chat(
+    chat_id: int,
+    log_message,
+):
+
+    scanned = 0
+    duplicates = 0
+    deleted = 0
+    failed = 0
+
+    duplicate_ids = []
+
+    seen: Set[tuple] = set()
+
     try:
 
-        return await context.bot.send_message(
-            chat_id=LOG_CHAT_ID,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=reply_markup,
+        entity = await get_entity(
+            chat_id
+        )
+
+        title = getattr(
+            entity,
+            "title",
+            str(chat_id),
+        )
+
+        await log_edit(
+            log_message,
+            (
+                "🧹 <b>DCLEAN STARTED</b>\n\n"
+                "━━━━━━━━━━━━━━\n"
+                f"📌 Chat: <b>{title}</b>\n"
+                f"🆔 <code>{chat_id}</code>\n"
+                "━━━━━━━━━━━━━━\n\n"
+                "🔍 Scanning history..."
+            ),
+        )
+
+        last_progress = 0
+
+        # OLD → NEW
+        async for message in tg.iter_messages(
+            entity,
+            reverse=True,
+        ):
+
+            scanned += 1
+
+            key = media_key(
+                message
+            )
+
+            if key is None:
+                continue
+
+            if key in seen:
+
+                duplicate_ids.append(
+                    message.id
+                )
+
+                duplicates += 1
+
+            else:
+
+                seen.add(key)
+
+            if (
+                scanned - last_progress
+                >= PROGRESS_EVERY
+            ):
+
+                last_progress = scanned
+
+                await log_edit(
+                    log_message,
+                    (
+                        "🧹 <b>DCLEAN</b>\n\n"
+                        "━━━━━━━━━━━━━━\n"
+                        f"📌 Chat: <b>{title}</b>\n"
+                        f"🆔 <code>{chat_id}</code>\n"
+                        "━━━━━━━━━━━━━━\n\n"
+                        f"🔍 Scanned: "
+                        f"<b>{scanned:,}</b>\n"
+                        f"♻️ Duplicates: "
+                        f"<b>{duplicates:,}</b>\n"
+                        f"🗑️ Deleted: "
+                        f"<b>{deleted:,}</b>\n"
+                        f"⏳ Remaining: "
+                        f"<b>{len(duplicate_ids):,}</b>"
+                    ),
+                )
+
+                await asyncio.sleep(0)
+
+        if not duplicate_ids:
+
+            await log_edit(
+                log_message,
+                (
+                    "✅ <b>DCLEAN COMPLETED</b>\n\n"
+                    "━━━━━━━━━━━━━━\n"
+                    f"📌 Chat: <b>{title}</b>\n"
+                    f"🆔 <code>{chat_id}</code>\n"
+                    "━━━━━━━━━━━━━━\n\n"
+                    f"📨 Scanned: "
+                    f"<b>{scanned:,}</b>\n"
+                    "♻️ Duplicates: <b>0</b>\n"
+                    "🗑️ Deleted: <b>0</b>\n\n"
+                    "✅ No duplicate files found."
+                ),
+            )
+
+            return
+
+        # ====================================================
+        # DELETE DUPLICATES
+        # ====================================================
+
+        total = len(
+            duplicate_ids
+        )
+
+        await log_edit(
+            log_message,
+            (
+                "🗑️ <b>DELETING DUPLICATES</b>\n\n"
+                "━━━━━━━━━━━━━━\n"
+                f"📌 Chat: <b>{title}</b>\n"
+                "━━━━━━━━━━━━━━\n\n"
+                f"🔍 Scanned: "
+                f"<b>{scanned:,}</b>\n"
+                f"♻️ Duplicates: "
+                f"<b>{total:,}</b>\n"
+                f"🗑️ Deleted: "
+                f"<b>0</b>\n"
+                f"⏳ Remaining: "
+                f"<b>{total:,}</b>"
+            ),
+        )
+
+        for start in range(
+            0,
+            total,
+            DELETE_BATCH,
+        ):
+
+            batch = duplicate_ids[
+                start:start + DELETE_BATCH
+            ]
+
+            while True:
+
+                try:
+
+                    await tg.delete_messages(
+                        entity,
+                        batch,
+                        revoke=True,
+                    )
+
+                    deleted += len(
+                        batch
+                    )
+
+                    break
+
+                except FloodWaitError as e:
+
+                    await log_edit(
+                        log_message,
+                        (
+                            "⏳ <b>TELEGRAM FLOOD WAIT</b>\n\n"
+                            f"Waiting <b>{e.seconds}s</b>...\n\n"
+                            f"🗑️ Deleted: "
+                            f"<b>{deleted:,}</b>\n"
+                            f"⏳ Remaining: "
+                            f"<b>{total-deleted:,}</b>"
+                        ),
+                    )
+
+                    await asyncio.sleep(
+                        e.seconds
+                    )
+
+                except RPCError as e:
+
+                    logger.error(
+                        "Delete RPC error: %s",
+                        e,
+                    )
+
+                    failed += len(
+                        batch
+                    )
+
+                    break
+
+                except Exception as e:
+
+                    logger.exception(
+                        "Delete error"
+                    )
+
+                    failed += len(
+                        batch
+                    )
+
+                    break
+
+            if (
+                deleted % 500 == 0
+                or deleted == total
+            ):
+
+                await log_edit(
+                    log_message,
+                    (
+                        "🧹 <b>DCLEAN PROGRESS</b>\n\n"
+                        "━━━━━━━━━━━━━━\n"
+                        f"📌 Chat: <b>{title}</b>\n"
+                        "━━━━━━━━━━━━━━\n\n"
+                        f"🔍 Scanned: "
+                        f"<b>{scanned:,}</b>\n"
+                        f"♻️ Duplicates: "
+                        f"<b>{total:,}</b>\n"
+                        f"🗑️ Deleted: "
+                        f"<b>{deleted:,}</b>\n"
+                        f"❌ Failed: "
+                        f"<b>{failed:,}</b>\n"
+                        f"⏳ Remaining: "
+                        f"<b>{max(total-deleted,0):,}</b>"
+                    ),
+                )
+
+            await asyncio.sleep(
+                DELETE_PAUSE
+            )
+
+        await log_edit(
+            log_message,
+            (
+                "✅ <b>DCLEAN COMPLETED</b>\n\n"
+                "━━━━━━━━━━━━━━\n"
+                f"📌 Chat: <b>{title}</b>\n"
+                f"🆔 <code>{chat_id}</code>\n"
+                "━━━━━━━━━━━━━━\n\n"
+                f"📨 Scanned: "
+                f"<b>{scanned:,}</b>\n"
+                f"♻️ Duplicates: "
+                f"<b>{total:,}</b>\n"
+                f"🗑️ Deleted: "
+                f"<b>{deleted:,}</b>\n"
+                f"❌ Failed: "
+                f"<b>{failed:,}</b>\n\n"
+                "✅ Duplicate files removed."
+            ),
         )
 
     except Exception as e:
 
         logger.exception(
-            "Could not send log message: %s",
-            e,
+            "DCLEAN failed"
         )
 
-        return None
+        await log_edit(
+            log_message,
+            (
+                "❌ <b>DCLEAN FAILED</b>\n\n"
+                f"🆔 <code>{chat_id}</code>\n\n"
+                f"<code>{str(e)[:1200]}</code>"
+            ),
+        )
 
 
 # ============================================================
-# WIPE FUNCTION
+# /DCLEAN
 # ============================================================
 
-async def wipe_chat(
-    chat_id: int,
-    chat_name: str,
+async def dclean_command(
+    update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    trigger: str = "Manual",
 ):
 
-    lock = get_wipe_lock(
-        chat_id
-    )
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
 
-    if lock.locked():
+    if not message or not chat:
+        return
 
-        logger.info(
-            "WIPE already running: %s",
-            chat_id,
+    # ONLY LOG CHAT
+    if chat.id != LOG_CHAT_ID:
+        return
+
+    if not user or not is_bot_admin(
+        user.id
+    ):
+        return
+
+    if not context.args:
+
+        await message.reply_text(
+            "Usage:\n\n"
+            "<code>/dclean -100XXXXXXXXXX</code>",
+            parse_mode=ParseMode.HTML,
         )
 
         return
 
-    async with lock:
+    try:
 
-        found = 0
-        deleted = 0
-        failed = 0
+        target_id = int(
+            context.args[0]
+        )
 
-        progress_message = None
+    except ValueError:
 
-        try:
+        await message.reply_text(
+            "❌ Invalid Chat ID."
+        )
 
-            # ------------------------------------------------
-            # ENTITY
-            # ------------------------------------------------
+        return
 
-            entity = await get_entity(
-                chat_id
+    if not await is_approved(
+        target_id
+    ):
+
+        await message.reply_text(
+            "❌ This chat is not approved."
+        )
+
+        return
+
+    old = dclean_tasks.get(
+        target_id
+    )
+
+    if old and not old.done():
+
+        await message.reply_text(
+            "⚠️ DCLEAN is already running "
+            "for this chat."
+        )
+
+        return
+
+    log_message = await message.reply_text(
+        "🧹 <b>DCLEAN STARTED</b>\n\n"
+        f"🆔 <code>{target_id}</code>\n\n"
+        "🔍 Scanning...",
+        parse_mode=ParseMode.HTML,
+    )
+
+    task = asyncio.create_task(
+        dclean_chat(
+            target_id,
+            log_message,
+        )
+    )
+
+    dclean_tasks[
+        target_id
+    ] = task
+
+
+# ============================================================
+# WIPE
+# ============================================================
+
+async def wipe_chat(
+    chat_id: int,
+    log_message,
+):
+
+    deleted = 0
+    total = 0
+
+    try:
+
+        entity = await get_entity(
+            chat_id
+        )
+
+        title = getattr(
+            entity,
+            "title",
+            str(chat_id),
+        )
+
+        await log_edit(
+            log_message,
+            (
+                "🧹 <b>WIPE STARTED</b>\n\n"
+                "━━━━━━━━━━━━━━\n"
+                f"📌 Chat: <b>{title}</b>\n"
+                f"🆔 <code>{chat_id}</code>\n"
+                f"🛡️ Keep: <b>{WIPE_KEEP}</b>\n"
+                "━━━━━━━━━━━━━━\n\n"
+                "🔍 Reading messages..."
+            ),
+        )
+
+        ids = []
+
+        async for msg in tg.iter_messages(
+            entity,
+            reverse=False,
+        ):
+
+            total += 1
+
+            if total <= WIPE_KEEP:
+                continue
+
+            ids.append(
+                msg.id
             )
 
-            # ------------------------------------------------
-            # START LOG
-            # ------------------------------------------------
+            if len(ids) >= DELETE_BATCH:
 
-            progress_message = await send_log(
-                context,
-                (
-                    "✅ <b>WIPE STARTED</b>\n\n"
-                    "━━━━━━━━━━━━━━\n"
-                    f"📌 Chat: "
-                    f"<b>{chat_name}</b>\n"
-                    f"🆔 <code>{chat_id}</code>\n"
-                    f"🎯 Trigger: "
-                    f"<b>{trigger}</b>\n"
-                    f"🛡️ Keep: "
-                    f"<b>{WIPE_KEEP_MESSAGES}</b>\n"
-                    "━━━━━━━━━━━━━━\n\n"
-                    "⏳ Processing..."
-                ),
-            )
-
-            # ------------------------------------------------
-            # TOTAL
-            # ------------------------------------------------
-
-            total = await get_message_count(
-                entity
-            )
-
-            logger.info(
-                "WIPE %s total messages: %s",
-                chat_id,
-                total,
-            )
-
-            # ------------------------------------------------
-            # NOTHING TO DELETE
-            # ------------------------------------------------
-
-            if total <= WIPE_KEEP_MESSAGES:
-
-                text = (
-                    "ℹ️ <b>WIPE NOT REQUIRED</b>\n\n"
-                    "━━━━━━━━━━━━━━\n"
-                    f"📌 Chat: "
-                    f"<b>{chat_name}</b>\n"
-                    f"🆔 <code>{chat_id}</code>\n"
-                    f"📨 Messages: "
-                    f"<b>{total:,}</b>\n"
-                    f"🛡️ Kept: "
-                    f"<b>{WIPE_KEEP_MESSAGES}</b>\n"
-                    "━━━━━━━━━━━━━━\n\n"
-                    "Nothing to delete."
-                )
-
-                if progress_message:
+                while ids:
 
                     try:
 
-                        await progress_message.edit_text(
-                            text,
-                            parse_mode=ParseMode.HTML,
-                        )
-
-                    except Exception:
-                        pass
-
-                return
-
-            # ------------------------------------------------
-            # DELETE IDS
-            # ------------------------------------------------
-
-            delete_ids = []
-
-            seen = 0
-
-            async for message in telethon_client.iter_messages(
-                entity,
-                reverse=False,
-            ):
-
-                seen += 1
-                found = seen
-
-                # Keep newest messages
-                if seen <= WIPE_KEEP_MESSAGES:
-                    continue
-
-                delete_ids.append(
-                    message.id
-                )
-
-                # ------------------------------------------------
-                # DELETE BATCH
-                # ------------------------------------------------
-
-                if len(delete_ids) >= WIPE_BATCH_SIZE:
-
-                    batch = list(
-                        delete_ids
-                    )
-
-                    delete_ids.clear()
-
-                    while batch:
-
-                        try:
-
-                            await telethon_client.delete_messages(
-                                entity,
-                                batch,
-                                revoke=True,
-                            )
-
-                            deleted += len(
-                                batch
-                            )
-
-                            batch.clear()
-
-                        except FloodWaitError as e:
-
-                            logger.warning(
-                                "FloodWait %s seconds",
-                                e.seconds,
-                            )
-
-                            if progress_message:
-
-                                try:
-
-                                    await progress_message.edit_text(
-                                        (
-                                            "⏳ <b>WIPE WAITING</b>\n\n"
-                                            f"📌 Chat: "
-                                            f"<b>{chat_name}</b>\n"
-                                            f"🗑️ Deleted: "
-                                            f"<b>{deleted:,}</b>\n"
-                                            f"⏱️ Telegram wait: "
-                                            f"<b>{e.seconds}s</b>\n\n"
-                                            "Will continue automatically."
-                                        ),
-                                        parse_mode=ParseMode.HTML,
-                                    )
-
-                                except Exception:
-                                    pass
-
-                            await asyncio.sleep(
-                                e.seconds
-                            )
-
-                        except RPCError as e:
-
-                            logger.error(
-                                "WIPE RPC error: %s",
-                                e,
-                            )
-
-                            failed += len(
-                                batch
-                            )
-
-                            batch.clear()
-
-                        except Exception as e:
-
-                            logger.exception(
-                                "WIPE delete error: %s",
-                                e,
-                            )
-
-                            failed += len(
-                                batch
-                            )
-
-                            batch.clear()
-
-                    # ------------------------------------------------
-                    # PROGRESS
-                    # ------------------------------------------------
-
-                    if progress_message:
-
-                        if (
-                            deleted % WIPE_PROGRESS_EVERY == 0
-                            or deleted == 0
-                        ):
-
-                            try:
-
-                                await progress_message.edit_text(
-                                    (
-                                        "🧹 <b>WIPE IN PROGRESS</b>\n\n"
-                                        "━━━━━━━━━━━━━━\n"
-                                        f"📌 Chat: "
-                                        f"<b>{chat_name}</b>\n"
-                                        f"📨 Found: "
-                                        f"<b>{seen:,}</b>\n"
-                                        f"🗑️ Deleted: "
-                                        f"<b>{deleted:,}</b>\n"
-                                        f"❌ Failed: "
-                                        f"<b>{failed:,}</b>\n"
-                                        f"🛡️ Keep: "
-                                        f"<b>{WIPE_KEEP_MESSAGES}</b>\n"
-                                        "━━━━━━━━━━━━━━"
-                                    ),
-                                    parse_mode=ParseMode.HTML,
-                                )
-
-                            except Exception:
-                                pass
-
-                    await asyncio.sleep(
-                        WIPE_PAUSE
-                    )
-
-            # ------------------------------------------------
-            # FINAL BATCH
-            # ------------------------------------------------
-
-            if delete_ids:
-
-                batch = list(
-                    delete_ids
-                )
-
-                while batch:
-
-                    try:
-
-                        await telethon_client.delete_messages(
+                        await tg.delete_messages(
                             entity,
-                            batch,
+                            ids,
                             revoke=True,
                         )
 
                         deleted += len(
-                            batch
+                            ids
                         )
 
-                        batch.clear()
+                        ids.clear()
 
                     except FloodWaitError as e:
-
-                        logger.warning(
-                            "Final FloodWait: %s",
-                            e.seconds,
-                        )
 
                         await asyncio.sleep(
                             e.seconds
                         )
 
-                    except RPCError as e:
+                    except Exception:
 
-                        logger.error(
-                            "Final RPC error: %s",
-                            e,
-                        )
+                        ids.clear()
 
-                        failed += len(
-                            batch
-                        )
+                await log_edit(
+                    log_message,
+                    (
+                        "🧹 <b>WIPE PROGRESS</b>\n\n"
+                        f"📌 <b>{title}</b>\n\n"
+                        f"📨 Found: "
+                        f"<b>{total:,}</b>\n"
+                        f"🗑️ Deleted: "
+                        f"<b>{deleted:,}</b>\n"
+                        f"🛡️ Keep: "
+                        f"<b>{WIPE_KEEP}</b>"
+                    ),
+                )
 
-                        batch.clear()
+        if ids:
 
-                    except Exception as e:
+            try:
 
-                        logger.exception(
-                            "Final delete error: %s",
-                            e,
-                        )
+                await tg.delete_messages(
+                    entity,
+                    ids,
+                    revoke=True,
+                )
 
-                        failed += len(
-                            batch
-                        )
+                deleted += len(
+                    ids
+                )
 
-                        batch.clear()
+            except FloodWaitError as e:
 
-            # ------------------------------------------------
-            # COMPLETED
-            # ------------------------------------------------
-
-            kept = min(
-                total,
-                WIPE_KEEP_MESSAGES,
-            )
-
-            result_text = (
-                "✅ <b>WIPE COMPLETED</b>\n\n"
-                "━━━━━━━━━━━━━━\n"
-                f"📌 Chat: "
-                f"<b>{chat_name}</b>\n"
-                f"🆔 <code>{chat_id}</code>\n"
-                f"📨 Found: "
-                f"<b>{total:,}</b>\n"
-                f"🗑️ Deleted: "
-                f"<b>{deleted:,}</b>\n"
-                f"❌ Failed: "
-                f"<b>{failed:,}</b>\n"
-                f"🛡️ Kept: "
-                f"<b>{kept}</b>\n"
-                "━━━━━━━━━━━━━━\n\n"
-                "✅ Target chat cleaned."
-            )
-
-            if progress_message:
+                await asyncio.sleep(
+                    e.seconds
+                )
 
                 try:
 
-                    await progress_message.edit_text(
-                        result_text,
-                        parse_mode=ParseMode.HTML,
+                    await tg.delete_messages(
+                        entity,
+                        ids,
+                        revoke=True,
                     )
 
-                except Exception:
-
-                    await send_log(
-                        context,
-                        result_text,
-                    )
-
-        except Exception as e:
-
-            logger.exception(
-                "WIPE failed"
-            )
-
-            error_text = (
-                "❌ <b>WIPE FAILED</b>\n\n"
-                "━━━━━━━━━━━━━━\n"
-                f"📌 Chat: "
-                f"<b>{chat_name}</b>\n"
-                f"🆔 <code>{chat_id}</code>\n"
-                f"📨 Processed: "
-                f"<b>{found:,}</b>\n"
-                f"🗑️ Deleted: "
-                f"<b>{deleted:,}</b>\n"
-                f"❌ Failed: "
-                f"<b>{failed:,}</b>\n"
-                "━━━━━━━━━━━━━━\n\n"
-                f"<code>{str(e)[:1000]}</code>"
-            )
-
-            if progress_message:
-
-                try:
-
-                    await progress_message.edit_text(
-                        error_text,
-                        parse_mode=ParseMode.HTML,
+                    deleted += len(
+                        ids
                     )
 
                 except Exception:
                     pass
 
-            else:
+            except Exception:
+                pass
 
-                await send_log(
-                    context,
-                    error_text,
-                )
+        await log_edit(
+            log_message,
+            (
+                "✅ <b>WIPE COMPLETED</b>\n\n"
+                "━━━━━━━━━━━━━━\n"
+                f"📌 Chat: <b>{title}</b>\n"
+                f"🆔 <code>{chat_id}</code>\n"
+                "━━━━━━━━━━━━━━\n\n"
+                f"📨 Found: <b>{total:,}</b>\n"
+                f"🗑️ Deleted: <b>{deleted:,}</b>\n"
+                f"🛡️ Kept: <b>{min(total, WIPE_KEEP)}</b>\n"
+                "━━━━━━━━━━━━━━"
+            ),
+        )
 
-        finally:
+    except Exception as e:
 
-            wipe_tasks.pop(
-                chat_id,
-                None,
-            )
+        logger.exception(
+            "WIPE failed"
+        )
 
-
-# ============================================================
-# START
-# ============================================================
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_bot_admin(
-        update
-    ):
-        return
-
-    if not update.effective_message:
-        return
-
-    await update.effective_message.reply_text(
-        "🧹 <b>WIPE BOT</b>\n\n"
-        "━━━━━━━━━━━━━━\n"
-        f"🛡️ Keep: "
-        f"<b>{WIPE_KEEP_MESSAGES}</b> messages\n"
-        f"⚡ Auto WIPE: "
-        f"<b>{WIPE_THRESHOLD}</b> messages\n"
-        "━━━━━━━━━━━━━━\n\n"
-        "Manual:\n"
-        "<code>/wipe -100XXXXXXXXXX</code>",
-        parse_mode=ParseMode.HTML,
-    )
+        await log_edit(
+            log_message,
+            (
+                "❌ <b>WIPE FAILED</b>\n\n"
+                f"🆔 <code>{chat_id}</code>\n\n"
+                f"<code>{str(e)[:1200]}</code>"
+            ),
+        )
 
 
 # ============================================================
@@ -908,45 +832,26 @@ async def wipe_command(
 ):
 
     message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
 
-    if not message:
+    if not message or not chat:
         return
 
-    # --------------------------------------------------------
-    # ONLY LOG GROUP
-    # --------------------------------------------------------
-
-    if (
-        update.effective_chat
-        and update.effective_chat.id
-        != LOG_CHAT_ID
-    ):
-
-        await message.reply_text(
-            "❌ Use /wipe from the Log group."
-        )
-
+    # ONLY LOG CHAT
+    if chat.id != LOG_CHAT_ID:
         return
 
-    # --------------------------------------------------------
-    # ADMIN
-    # --------------------------------------------------------
-
-    if not await require_bot_admin(
-        update
+    if not user or not is_bot_admin(
+        user.id
     ):
         return
-
-    # --------------------------------------------------------
-    # ARGUMENT
-    # --------------------------------------------------------
 
     if not context.args:
 
         await message.reply_text(
-            "❌ Chat ID missing.\n\n"
-            "Example:\n"
-            "<code>/wipe -1003719625887</code>",
+            "Usage:\n\n"
+            "<code>/wipe -100XXXXXXXXXX</code>",
             parse_mode=ParseMode.HTML,
         )
 
@@ -954,7 +859,7 @@ async def wipe_command(
 
     try:
 
-        chat_id = int(
+        target_id = int(
             context.args[0]
         )
 
@@ -966,231 +871,175 @@ async def wipe_command(
 
         return
 
-    # --------------------------------------------------------
-    # CHECK RUNNING
-    # --------------------------------------------------------
-
-    existing = wipe_tasks.get(
-        chat_id
-    )
-
-    if (
-        existing
-        and not existing.done()
+    if not await is_approved(
+        target_id
     ):
 
         await message.reply_text(
-            "⏳ WIPE is already running "
-            "for this chat."
+            "❌ This chat is not approved."
         )
 
         return
 
-    # --------------------------------------------------------
-    # GET CHAT
-    # --------------------------------------------------------
+    old = wipe_tasks.get(
+        target_id
+    )
 
-    try:
-
-        chat = await context.bot.get_chat(
-            chat_id
-        )
-
-        chat_name = (
-            chat.title
-            or str(chat_id)
-        )
-
-    except Exception as e:
+    if old and not old.done():
 
         await message.reply_text(
-            "❌ Could not access target chat.\n\n"
-            f"<code>{str(e)[:700]}</code>",
-            parse_mode=ParseMode.HTML,
+            "⚠️ WIPE already running."
         )
 
         return
 
-    # --------------------------------------------------------
-    # START
-    # --------------------------------------------------------
+    log_message = await message.reply_text(
+        "🧹 <b>WIPE STARTED</b>\n\n"
+        f"🆔 <code>{target_id}</code>\n"
+        f"🛡️ Keep: <b>{WIPE_KEEP}</b>",
+        parse_mode=ParseMode.HTML,
+    )
 
     task = asyncio.create_task(
         wipe_chat(
-            chat_id,
-            chat_name,
-            context,
-            "Manual /wipe",
+            target_id,
+            log_message,
         )
     )
 
     wipe_tasks[
-        chat_id
+        target_id
     ] = task
 
-    await message.reply_text(
-        "✅ WIPE command accepted.\n\n"
-        f"📌 Chat: <b>{chat_name}</b>\n"
-        f"🆔 <code>{chat_id}</code>\n\n"
-        "Progress will be shown here.",
-        parse_mode=ParseMode.HTML,
+
+# ============================================================
+# AUTO WIPE
+# ============================================================
+
+async def auto_wipe_check(
+    chat_id: int,
+):
+
+    if not await is_approved(
+        chat_id
+    ):
+        return
+
+    lock = auto_wipe_locks.setdefault(
+        chat_id,
+        asyncio.Lock(),
     )
 
+    if lock.locked():
+        return
 
-# ============================================================
-# GROUP ADMIN CHECK
-# ============================================================
-
-async def is_group_admin(
-    update: Update,
-) -> bool:
-
-    message = update.effective_message
-    chat = update.effective_chat
-
-    if not message or not chat:
-        return False
-
-    if chat.type not in (
-        "group",
-        "supergroup",
-    ):
-        return False
-
-    user = update.effective_user
-
-    if user:
+    async with lock:
 
         try:
 
-            member = await update.get_bot().get_chat_member(
-                chat.id,
-                user.id,
+            entity = await get_entity(
+                chat_id
             )
 
-            if member.status in (
-                ChatMemberStatus.ADMINISTRATOR,
-                ChatMemberStatus.OWNER,
+            count = 0
+
+            async for _ in tg.iter_messages(
+                entity,
+                limit=AUTO_WIPE_LIMIT,
             ):
 
-                return True
+                count += 1
+
+                if count >= AUTO_WIPE_LIMIT:
+                    break
+
+            if count < AUTO_WIPE_LIMIT:
+                return
+
+            # create log message
+            try:
+
+                log_message = await tg_bot.send_message(
+                    LOG_CHAT_ID,
+                    (
+                        "⚡ <b>AUTO WIPE STARTED</b>\n\n"
+                        f"🆔 <code>{chat_id}</code>\n"
+                        f"📨 Threshold: "
+                        f"<b>{AUTO_WIPE_LIMIT}</b>\n"
+                        f"🛡️ Keep: "
+                        f"<b>{WIPE_KEEP}</b>"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+
+            except Exception:
+                return
+
+            old = wipe_tasks.get(
+                chat_id
+            )
+
+            if old and not old.done():
+                return
+
+            wipe_tasks[
+                chat_id
+            ] = asyncio.create_task(
+                wipe_chat(
+                    chat_id,
+                    log_message,
+                )
+            )
 
         except Exception as e:
 
-            logger.warning(
-                "Group admin check failed: %s",
+            logger.error(
+                "Auto wipe check failed: %s",
                 e,
             )
 
-    sender_chat = message.sender_chat
 
-    if (
-        sender_chat
-        and sender_chat.id == chat.id
-    ):
+# ============================================================
+# TELEGRAM BOT OBJECT FOR AUTO WIPE
+# ============================================================
 
-        return True
-
-    return False
+tg_bot = None
 
 
 # ============================================================
-# AUTO WIPE CHECK
+# MESSAGE WATCHER
 # ============================================================
 
-async def automatic_wipe_check(
+async def message_watcher(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
     message = update.effective_message
+
+    if not message:
+        return
+
     chat = update.effective_chat
 
-    if not message or not chat:
+    if not chat:
         return
 
     if chat.type not in (
         "group",
         "supergroup",
+        "channel",
     ):
         return
 
-    # --------------------------------------------------------
-    # APPROVAL
-    # --------------------------------------------------------
-
-    if not await is_group_approved(
+    if not await is_approved(
         chat.id
     ):
         return
 
-    # --------------------------------------------------------
-    # COUNT
-    # --------------------------------------------------------
-
-    try:
-
-        entity = await get_entity(
-            chat.id
-        )
-
-        total = await get_message_count(
-            entity
-        )
-
-    except Exception as e:
-
-        logger.warning(
-            "Auto count failed: %s",
-            e,
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # THRESHOLD
-    # --------------------------------------------------------
-
-    if total < WIPE_THRESHOLD:
-        return
-
-    # --------------------------------------------------------
-    # ALREADY RUNNING
-    # --------------------------------------------------------
-
-    existing = wipe_tasks.get(
+    await auto_wipe_check(
         chat.id
     )
-
-    if (
-        existing
-        and not existing.done()
-    ):
-        return
-
-    chat_name = (
-        chat.title
-        or "Unknown Group"
-    )
-
-    logger.info(
-        "AUTO WIPE TRIGGERED: %s (%s messages)",
-        chat_name,
-        total,
-    )
-
-    task = asyncio.create_task(
-        wipe_chat(
-            chat.id,
-            chat_name,
-            context,
-            f"Automatic ({total} messages)",
-        )
-    )
-
-    wipe_tasks[
-        chat.id
-    ] = task
 
 
 # ============================================================
@@ -1202,12 +1051,12 @@ async def bot_membership_update(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    membership = update.my_chat_member
+    change = update.my_chat_member
 
-    if not membership:
+    if not change:
         return
 
-    chat = membership.chat
+    chat = change.chat
 
     if chat.type not in (
         "group",
@@ -1215,105 +1064,78 @@ async def bot_membership_update(
     ):
         return
 
-    old_member = (
-        membership.old_chat_member
+    old = change.old_chat_member
+    new = change.new_chat_member
+
+    was = old.status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
     )
 
-    new_member = (
-        membership.new_chat_member
+    now = new.status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
     )
 
-    bot_was_member = (
-        old_member.status
-        in (
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-        )
-    )
+    if not now or was:
+        return
 
-    bot_is_member = (
-        new_member.status
-        in (
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-        )
-    )
-
-    # --------------------------------------------------------
-    # NEW GROUP
-    # --------------------------------------------------------
-
-    if (
-        bot_is_member
-        and not bot_was_member
+    if await is_approved(
+        chat.id
     ):
+        return
 
-        if await is_group_approved(
-            chat.id
-        ):
-            return
+    title = (
+        chat.title
+        or "Unknown Group"
+    )
 
-        title = (
-            chat.title
-            or "Unknown Group"
-        )
+    added_by = change.from_user
 
-        added_by = membership.from_user
-
-        added_name = (
-            added_by.full_name
+    pending_approvals[
+        chat.id
+    ] = {
+        "title": title,
+        "added_by": (
+            added_by.id
             if added_by
-            else "Unknown"
-        )
+            else None
+        ),
+    }
 
-        pending_approvals[
-            chat.id
-        ] = {
-            "title": title,
-            "added_by": (
-                added_by.id
-                if added_by
-                else None
-            ),
-        }
-
-        keyboard = InlineKeyboardMarkup(
+    keyboard = InlineKeyboardMarkup(
+        [
             [
-                [
-                    InlineKeyboardButton(
-                        "✅ APPROVE",
-                        callback_data=(
-                            f"approve_group:"
-                            f"{chat.id}"
-                        ),
+                InlineKeyboardButton(
+                    "✅ APPROVE",
+                    callback_data=(
+                        f"approve:{chat.id}"
                     ),
-                    InlineKeyboardButton(
-                        "❌ REJECT",
-                        callback_data=(
-                            f"reject_group:"
-                            f"{chat.id}"
-                        ),
+                ),
+                InlineKeyboardButton(
+                    "❌ REJECT",
+                    callback_data=(
+                        f"reject:{chat.id}"
                     ),
-                ]
+                ),
             ]
-        )
+        ]
+    )
 
-        await send_log(
-            context,
-            (
-                "🤖 <b>NEW GROUP ADDED</b>\n\n"
-                "━━━━━━━━━━━━━━\n"
-                f"📌 Group: "
-                f"<b>{title}</b>\n"
-                f"🆔 <code>{chat.id}</code>\n"
-                f"👤 Added by: "
-                f"<b>{added_name}</b>\n"
-                "━━━━━━━━━━━━━━\n\n"
-                "⚠️ This group is NOT approved yet.\n\n"
-                "Approve this group?"
-            ),
-            keyboard,
-        )
+    await context.bot.send_message(
+        LOG_CHAT_ID,
+        (
+            "🤖 <b>NEW GROUP ADDED</b>\n\n"
+            "━━━━━━━━━━━━━━\n"
+            f"📌 Group: <b>{title}</b>\n"
+            f"🆔 <code>{chat.id}</code>\n"
+            "━━━━━━━━━━━━━━\n\n"
+            "⚠️ This group is NOT approved yet.\n\n"
+            "Approve this group?"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
 
 
 # ============================================================
@@ -1330,102 +1152,33 @@ async def callback_handler(
     if not query:
         return
 
+    await query.answer()
+
     user = query.from_user
 
-    if not is_admin(
+    if not user or not is_bot_admin(
         user.id
     ):
 
         await query.answer(
-            "❌ Not authorized.",
+            "❌ Not authorized",
             show_alert=True,
         )
 
         return
 
-    data = query.data or ""
-
-    await query.answer()
-
-    # --------------------------------------------------------
-    # APPROVE
-    # --------------------------------------------------------
+    data = query.data
 
     if data.startswith(
-        "approve_group:"
+        "approve:"
     ):
 
-        try:
-
-            chat_id = int(
-                data.split(
-                    ":",
-                    1,
-                )[1]
-            )
-
-        except ValueError:
-
-            return
-
-        pending = pending_approvals.get(
-            chat_id
+        chat_id = int(
+            data.split(
+                ":",
+                1,
+            )[1]
         )
-
-        if not pending:
-
-            await query.edit_message_text(
-                "⚠️ Approval request expired."
-            )
-
-            return
-
-        await approve_group(
-            chat_id,
-            pending["title"],
-            user.id,
-        )
-
-        pending_approvals.pop(
-            chat_id,
-            None,
-        )
-
-        await query.edit_message_text(
-            "✅ <b>GROUP APPROVED</b>\n\n"
-            f"📌 Group: "
-            f"<b>{pending['title']}</b>\n"
-            f"🆔 <code>{chat_id}</code>\n\n"
-            "🟢 Automatic WIPE enabled.\n"
-            f"⚡ Threshold: "
-            f"<b>{WIPE_THRESHOLD}</b>\n"
-            f"🛡️ Keep: "
-            f"<b>{WIPE_KEEP_MESSAGES}</b>",
-            parse_mode=ParseMode.HTML,
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # REJECT
-    # --------------------------------------------------------
-
-    if data.startswith(
-        "reject_group:"
-    ):
-
-        try:
-
-            chat_id = int(
-                data.split(
-                    ":",
-                    1,
-                )[1]
-            )
-
-        except ValueError:
-
-            return
 
         pending = pending_approvals.get(
             chat_id
@@ -1437,7 +1190,51 @@ async def callback_handler(
             else "Unknown"
         )
 
-        await reject_group(
+        await save_approval(
+            chat_id,
+            title,
+            user.id,
+        )
+
+        pending_approvals.pop(
+            chat_id,
+            None,
+        )
+
+        await query.edit_message_text(
+            (
+                "✅ <b>GROUP APPROVED</b>\n\n"
+                f"📌 <b>{title}</b>\n"
+                f"🆔 <code>{chat_id}</code>\n\n"
+                "🟢 DCLEAN and WIPE enabled."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+        return
+
+    if data.startswith(
+        "reject:"
+    ):
+
+        chat_id = int(
+            data.split(
+                ":",
+                1,
+            )[1]
+        )
+
+        pending = pending_approvals.get(
+            chat_id
+        )
+
+        title = (
+            pending["title"]
+            if pending
+            else "Unknown"
+        )
+
+        await reject_approval(
             chat_id
         )
 
@@ -1447,14 +1244,45 @@ async def callback_handler(
         )
 
         await query.edit_message_text(
-            "❌ <b>GROUP REJECTED</b>\n\n"
-            f"📌 Group: "
-            f"<b>{title}</b>\n"
-            f"🆔 <code>{chat_id}</code>",
+            (
+                "❌ <b>GROUP REJECTED</b>\n\n"
+                f"📌 <b>{title}</b>\n"
+                f"🆔 <code>{chat_id}</code>"
+            ),
             parse_mode=ParseMode.HTML,
         )
 
         return
+
+
+# ============================================================
+# START
+# ============================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user = update.effective_user
+
+    if not user or not is_bot_admin(
+        user.id
+    ):
+        return
+
+    await update.effective_message.reply_text(
+        "🧹 <b>WIPE + DUPLICATE CLEANER</b>\n\n"
+        "━━━━━━━━━━━━━━\n"
+        "♻️ Duplicate Clean:\n"
+        "<code>/dclean CHAT_ID</code>\n\n"
+        "⚡ Wipe:\n"
+        "<code>/wipe CHAT_ID</code>\n"
+        "━━━━━━━━━━━━━━\n\n"
+        f"🛡️ Wipe Keep: <b>{WIPE_KEEP}</b>\n"
+        f"⚡ Auto Wipe: <b>{AUTO_WIPE_LIMIT}</b> messages",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 # ============================================================
@@ -1465,44 +1293,36 @@ async def post_init(
     application: Application,
 ):
 
+    global tg_bot
+
+    tg_bot = application.bot
+
+    await ensure_tg()
+
+    me = await tg.get_me()
+
     logger.info(
-        "Connecting Telethon..."
-    )
-
-    await ensure_telethon_connected()
-
-    me = await telethon_client.get_me()
-
-    logger.info(
-        "Telethon account: %s (%s)",
+        "String Session connected: %s (%s)",
         me.first_name,
         me.id,
     )
 
 
 # ============================================================
-# POST SHUTDOWN
+# SHUTDOWN
 # ============================================================
 
 async def post_shutdown(
     application: Application,
 ):
 
-    logger.info(
-        "Shutting down..."
-    )
-
     try:
-
-        await telethon_client.disconnect()
-
+        await tg.disconnect()
     except Exception:
         pass
 
     try:
-
-        mongo_client.close()
-
+        mongo.close()
     except Exception:
         pass
 
@@ -1521,14 +1341,17 @@ def main():
         .build()
     )
 
-    # --------------------------------------------------------
-    # COMMANDS
-    # --------------------------------------------------------
-
     application.add_handler(
         CommandHandler(
             "start",
-            start_command,
+            start,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "dclean",
+            dclean_command,
         )
     )
 
@@ -1539,10 +1362,6 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # BOT ADDED
-    # --------------------------------------------------------
-
     application.add_handler(
         ChatMemberHandler(
             bot_membership_update,
@@ -1550,61 +1369,40 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # CALLBACK
-    # --------------------------------------------------------
-
     application.add_handler(
         CallbackQueryHandler(
             callback_handler
         )
     )
 
-    # --------------------------------------------------------
-    # AUTOMATIC WIPE
+    # IMPORTANT:
+    # MessageHandler is imported from telegram.ext
+    # NOT telegram.MessageHandler
     #
-    # Every new message checks the count.
-    # When count >= 1500, WIPE starts.
-    # --------------------------------------------------------
+    # This watcher is needed for Auto WIPE.
+    from telegram.ext import MessageHandler, filters
 
     application.add_handler(
         MessageHandler(
             filters.ALL,
-            automatic_wipe_check,
+            message_watcher,
         ),
         group=10,
     )
 
-    # --------------------------------------------------------
-    # START
-    # --------------------------------------------------------
-
     logger.info(
-        "WIPE BOT STARTED"
-    )
-
-    logger.info(
-        "Threshold: %s",
-        WIPE_THRESHOLD,
-    )
-
-    logger.info(
-        "Keep: %s",
-        WIPE_KEEP_MESSAGES,
+        "Bot started."
     )
 
     application.run_polling(
         allowed_updates=[
             "message",
+            "channel_post",
             "callback_query",
             "my_chat_member",
         ]
     )
 
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
     main()
