@@ -191,6 +191,188 @@ def is_bot_admin(user_id: int) -> bool:
 
 
 # ============================================================
+# MANUAL /APPROVE
+# ============================================================
+
+async def approve_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not message or not chat:
+        return
+
+    # --------------------------------------------------------
+    # ONLY LOG CHAT
+    # --------------------------------------------------------
+
+    if chat.id != LOG_CHAT_ID:
+        return
+
+    # --------------------------------------------------------
+    # ONLY BOT ADMINS
+    # --------------------------------------------------------
+
+    if not user or not is_bot_admin(user.id):
+        return
+
+    # --------------------------------------------------------
+    # CHECK CHAT ID
+    # --------------------------------------------------------
+
+    if not context.args:
+
+        await message.reply_text(
+            (
+                "⚠️ <b>APPROVE USAGE</b>\n\n"
+                "Use:\n"
+                "<code>/approve -100XXXXXXXXXX</code>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+        return
+
+    try:
+
+        target_id = int(
+            context.args[0]
+        )
+
+    except ValueError:
+
+        await message.reply_text(
+            "❌ Invalid Chat ID.",
+            parse_mode=ParseMode.HTML,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # GET CHAT INFORMATION
+    # --------------------------------------------------------
+
+    title = "Unknown Chat"
+    chat_type = "Unknown"
+
+    try:
+
+        target_chat = await context.bot.get_chat(
+            target_id
+        )
+
+        title = (
+            getattr(
+                target_chat,
+                "title",
+                None,
+            )
+            or getattr(
+                target_chat,
+                "username",
+                None,
+            )
+            or str(target_id)
+        )
+
+        chat_type = getattr(
+            target_chat,
+            "type",
+            "unknown",
+        )
+
+    except Exception as e:
+
+        logger.warning(
+            "Could not get target chat %s: %s",
+            target_id,
+            e,
+        )
+
+        # ----------------------------------------------------
+        # Even if Bot API cannot fetch the chat,
+        # we still save the supplied ID.
+        # Telethon may be able to access it later.
+        # ----------------------------------------------------
+
+        try:
+
+            entity = await get_entity(
+                target_id
+            )
+
+            title = (
+                getattr(
+                    entity,
+                    "title",
+                    None,
+                )
+                or getattr(
+                    entity,
+                    "username",
+                    None,
+                )
+                or str(target_id)
+            )
+
+            if getattr(
+                entity,
+                "broadcast",
+                False,
+            ):
+                chat_type = "channel"
+            else:
+                chat_type = "group"
+
+        except Exception as tg_error:
+
+            logger.warning(
+                "Could not resolve chat through Telethon: %s",
+                tg_error,
+            )
+
+    # --------------------------------------------------------
+    # SAVE APPROVAL
+    # --------------------------------------------------------
+
+    await save_approval(
+        chat_id=target_id,
+        title=title,
+        admin_id=user.id,
+    )
+
+    # --------------------------------------------------------
+    # CONFIRMATION
+    # --------------------------------------------------------
+
+    await message.reply_text(
+        (
+            "✅ <b>CHAT APPROVED</b>\n\n"
+            "━━━━━━━━━━━━━━\n"
+            f"📌 Name: <b>{title}</b>\n"
+            f"🆔 ID: <code>{target_id}</code>\n"
+            f"📂 Type: <b>{chat_type}</b>\n"
+            "━━━━━━━━━━━━━━\n\n"
+            "🟢 <b>Approval saved successfully.</b>\n"
+            "♻️ DCLEAN: <b>Enabled</b>\n"
+            "🧹 WIPE: <b>Enabled</b>\n"
+            "⚡ AUTO WIPE: <b>Enabled</b>"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+    logger.info(
+        "Chat approved manually: %s by %s",
+        target_id,
+        user.id,
+    )
+
+
+# ============================================================
 # LOG
 # ============================================================
 
@@ -242,7 +424,6 @@ async def get_entity(chat_id: int):
 
 def media_key(message):
 
-    # Telegram document
     document = getattr(
         message,
         "document",
@@ -251,7 +432,6 @@ def media_key(message):
 
     if document:
 
-        # Telegram's stable file identity
         file_unique_id = getattr(
             document,
             "file_unique_id",
@@ -264,13 +444,11 @@ def media_key(message):
                 str(file_unique_id),
             )
 
-        # fallback
         return (
             "document",
             int(document.id),
         )
 
-    # Telegram photo
     photo = getattr(
         message,
         "photo",
@@ -279,7 +457,6 @@ def media_key(message):
 
     if photo:
 
-        # Photo id is used as fallback identity
         return (
             "photo",
             int(photo.id),
@@ -332,7 +509,6 @@ async def dclean_chat(
 
         last_progress = 0
 
-        # OLD → NEW
         async for message in tg.iter_messages(
             entity,
             reverse=True,
@@ -406,10 +582,6 @@ async def dclean_chat(
             )
 
             return
-
-        # ====================================================
-        # DELETE DUPLICATES
-        # ====================================================
 
         total = len(
             duplicate_ids
@@ -583,7 +755,6 @@ async def dclean_command(
     if not message or not chat:
         return
 
-    # ONLY LOG CHAT
     if chat.id != LOG_CHAT_ID:
         return
 
@@ -838,7 +1009,6 @@ async def wipe_command(
     if not message or not chat:
         return
 
-    # ONLY LOG CHAT
     if chat.id != LOG_CHAT_ID:
         return
 
@@ -956,7 +1126,6 @@ async def auto_wipe_check(
             if count < AUTO_WIPE_LIMIT:
                 return
 
-            # create log message
             try:
 
                 log_message = await tg_bot.send_message(
@@ -1152,8 +1321,6 @@ async def callback_handler(
     if not query:
         return
 
-    await query.answer()
-
     user = query.from_user
 
     if not user or not is_bot_admin(
@@ -1166,6 +1333,8 @@ async def callback_handler(
         )
 
         return
+
+    await query.answer()
 
     data = query.data
 
@@ -1277,7 +1446,9 @@ async def start(
         "♻️ Duplicate Clean:\n"
         "<code>/dclean CHAT_ID</code>\n\n"
         "⚡ Wipe:\n"
-        "<code>/wipe CHAT_ID</code>\n"
+        "<code>/wipe CHAT_ID</code>\n\n"
+        "✅ Approve:\n"
+        "<code>/approve CHAT_ID</code>\n"
         "━━━━━━━━━━━━━━\n\n"
         f"🛡️ Wipe Keep: <b>{WIPE_KEEP}</b>\n"
         f"⚡ Auto Wipe: <b>{AUTO_WIPE_LIMIT}</b> messages",
@@ -1341,12 +1512,33 @@ def main():
         .build()
     )
 
+    # --------------------------------------------------------
+    # START
+    # --------------------------------------------------------
+
     application.add_handler(
         CommandHandler(
             "start",
             start,
         )
     )
+
+    # --------------------------------------------------------
+    # APPROVE
+    # IMPORTANT:
+    # /approve works only inside LOG_CHAT_ID
+    # --------------------------------------------------------
+
+    application.add_handler(
+        CommandHandler(
+            "approve",
+            approve_command,
+        )
+    )
+
+    # --------------------------------------------------------
+    # DCLEAN
+    # --------------------------------------------------------
 
     application.add_handler(
         CommandHandler(
@@ -1355,12 +1547,20 @@ def main():
         )
     )
 
+    # --------------------------------------------------------
+    # WIPE
+    # --------------------------------------------------------
+
     application.add_handler(
         CommandHandler(
             "wipe",
             wipe_command,
         )
     )
+
+    # --------------------------------------------------------
+    # BOT MEMBERSHIP
+    # --------------------------------------------------------
 
     application.add_handler(
         ChatMemberHandler(
@@ -1369,17 +1569,20 @@ def main():
         )
     )
 
+    # --------------------------------------------------------
+    # CALLBACK
+    # --------------------------------------------------------
+
     application.add_handler(
         CallbackQueryHandler(
             callback_handler
         )
     )
 
-    # IMPORTANT:
-    # MessageHandler is imported from telegram.ext
-    # NOT telegram.MessageHandler
-    #
-    # This watcher is needed for Auto WIPE.
+    # --------------------------------------------------------
+    # MESSAGE WATCHER
+    # --------------------------------------------------------
+
     from telegram.ext import MessageHandler, filters
 
     application.add_handler(
