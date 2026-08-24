@@ -36,15 +36,11 @@ ADMIN_IDS = {
     if x.strip().lstrip("-").isdigit()
 }
 
-LOG_CHAT_ID = int(
-    os.getenv("PIPE_LOG_CHAT_ID", "0")
-)
+LOG_CHAT_ID = int(os.getenv("PIPE_LOG_CHAT_ID", "0"))
 
-# Wipe settings
 AUTO_WIPE_LIMIT = 1500
 WIPE_KEEP = 50
 
-# Speed / Telegram safety
 DELETE_BATCH = 100
 PROGRESS_EVERY = 500
 DELETE_PAUSE = 0.05
@@ -135,22 +131,38 @@ async def ensure_tg():
 
 
 # ============================================================
-# APPROVAL
+# PERMISSION CHECKS
 # ============================================================
 
-async def is_approved(chat_id: int) -> bool:
+async def is_dupe_approved(chat_id: int) -> bool:
 
     row = await approved_groups.find_one(
         {
             "_id": int(chat_id),
-            "approved": True,
+            "approved_dupe": True,
         }
     )
 
     return row is not None
 
 
-async def save_approval(
+async def is_wipe_approved(chat_id: int) -> bool:
+
+    row = await approved_groups.find_one(
+        {
+            "_id": int(chat_id),
+            "approved_wipe": True,
+        }
+    )
+
+    return row is not None
+
+
+# ============================================================
+# SAVE DUPE APPROVAL
+# ============================================================
+
+async def save_dupe_approval(
     chat_id: int,
     title: str,
     admin_id: int,
@@ -161,21 +173,31 @@ async def save_approval(
         {
             "$set": {
                 "title": title,
-                "approved": True,
-                "approved_by": int(admin_id),
+                "approved_dupe": True,
+                "dupe_approved_by": int(admin_id),
             }
         },
         upsert=True,
     )
 
 
-async def reject_approval(chat_id: int):
+# ============================================================
+# SAVE WIPE APPROVAL
+# ============================================================
+
+async def save_wipe_approval(
+    chat_id: int,
+    title: str,
+    admin_id: int,
+):
 
     await approved_groups.update_one(
         {"_id": int(chat_id)},
         {
             "$set": {
-                "approved": False,
+                "title": title,
+                "approved_wipe": True,
+                "wipe_approved_by": int(admin_id),
             }
         },
         upsert=True,
@@ -191,10 +213,76 @@ def is_bot_admin(user_id: int) -> bool:
 
 
 # ============================================================
-# MANUAL /APPROVE
+# GET CHAT INFO
 # ============================================================
 
-async def approve_command(
+async def resolve_chat_info(
+    context,
+    chat_id: int,
+):
+
+    title = "Unknown Chat"
+    chat_type = "unknown"
+
+    try:
+
+        target_chat = await context.bot.get_chat(
+            chat_id
+        )
+
+        title = (
+            getattr(target_chat, "title", None)
+            or getattr(target_chat, "username", None)
+            or str(chat_id)
+        )
+
+        chat_type = getattr(
+            target_chat,
+            "type",
+            "unknown",
+        )
+
+        return title, chat_type
+
+    except Exception as e:
+
+        logger.warning(
+            "Bot API could not resolve %s: %s",
+            chat_id,
+            e,
+        )
+
+    try:
+
+        entity = await get_entity(chat_id)
+
+        title = (
+            getattr(entity, "title", None)
+            or getattr(entity, "username", None)
+            or str(chat_id)
+        )
+
+        if getattr(entity, "broadcast", False):
+            chat_type = "channel"
+        else:
+            chat_type = "group"
+
+    except Exception as e:
+
+        logger.warning(
+            "Telethon could not resolve %s: %s",
+            chat_id,
+            e,
+        )
+
+    return title, chat_type
+
+
+# ============================================================
+# /APPROVEDUPE
+# ============================================================
+
+async def approvedupe_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
@@ -206,31 +294,19 @@ async def approve_command(
     if not message or not chat:
         return
 
-    # --------------------------------------------------------
-    # ONLY LOG CHAT
-    # --------------------------------------------------------
-
     if chat.id != LOG_CHAT_ID:
         return
 
-    # --------------------------------------------------------
-    # ONLY BOT ADMINS
-    # --------------------------------------------------------
-
     if not user or not is_bot_admin(user.id):
         return
-
-    # --------------------------------------------------------
-    # CHECK CHAT ID
-    # --------------------------------------------------------
 
     if not context.args:
 
         await message.reply_text(
             (
-                "⚠️ <b>APPROVE USAGE</b>\n\n"
+                "⚠️ <b>APPROVEDUPE</b>\n\n"
                 "Use:\n"
-                "<code>/approve -100XXXXXXXXXX</code>"
+                "<code>/approvedupe -100XXXXXXXXXX</code>"
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -239,134 +315,127 @@ async def approve_command(
 
     try:
 
-        target_id = int(
-            context.args[0]
-        )
+        target_id = int(context.args[0])
 
     except ValueError:
 
         await message.reply_text(
-            "❌ Invalid Chat ID.",
-            parse_mode=ParseMode.HTML,
+            "❌ Invalid Chat ID."
         )
 
         return
 
-    # --------------------------------------------------------
-    # GET CHAT INFORMATION
-    # --------------------------------------------------------
-
-    title = "Unknown Chat"
-    chat_type = "Unknown"
-
-    try:
-
-        target_chat = await context.bot.get_chat(
-            target_id
-        )
-
-        title = (
-            getattr(
-                target_chat,
-                "title",
-                None,
-            )
-            or getattr(
-                target_chat,
-                "username",
-                None,
-            )
-            or str(target_id)
-        )
-
-        chat_type = getattr(
-            target_chat,
-            "type",
-            "unknown",
-        )
-
-    except Exception as e:
-
-        logger.warning(
-            "Could not get target chat %s: %s",
-            target_id,
-            e,
-        )
-
-        # ----------------------------------------------------
-        # Even if Bot API cannot fetch the chat,
-        # we still save the supplied ID.
-        # Telethon may be able to access it later.
-        # ----------------------------------------------------
-
-        try:
-
-            entity = await get_entity(
-                target_id
-            )
-
-            title = (
-                getattr(
-                    entity,
-                    "title",
-                    None,
-                )
-                or getattr(
-                    entity,
-                    "username",
-                    None,
-                )
-                or str(target_id)
-            )
-
-            if getattr(
-                entity,
-                "broadcast",
-                False,
-            ):
-                chat_type = "channel"
-            else:
-                chat_type = "group"
-
-        except Exception as tg_error:
-
-            logger.warning(
-                "Could not resolve chat through Telethon: %s",
-                tg_error,
-            )
-
-    # --------------------------------------------------------
-    # SAVE APPROVAL
-    # --------------------------------------------------------
-
-    await save_approval(
-        chat_id=target_id,
-        title=title,
-        admin_id=user.id,
+    title, chat_type = await resolve_chat_info(
+        context,
+        target_id,
     )
 
-    # --------------------------------------------------------
-    # CONFIRMATION
-    # --------------------------------------------------------
+    await save_dupe_approval(
+        target_id,
+        title,
+        user.id,
+    )
 
     await message.reply_text(
         (
-            "✅ <b>CHAT APPROVED</b>\n\n"
+            "♻️ <b>DUPLICATE CLEAN APPROVED</b>\n\n"
             "━━━━━━━━━━━━━━\n"
             f"📌 Name: <b>{title}</b>\n"
-            f"🆔 ID: <code>{target_id}</code>\n"
+            f"🆔 <code>{target_id}</code>\n"
             f"📂 Type: <b>{chat_type}</b>\n"
             "━━━━━━━━━━━━━━\n\n"
-            "🟢 <b>Approval saved successfully.</b>\n"
-            "♻️ DCLEAN: <b>Enabled</b>\n"
-            "🧹 WIPE: <b>Enabled</b>\n"
-            "⚡ AUTO WIPE: <b>Enabled</b>"
+            "♻️ DCLEAN: <b>ENABLED</b>\n"
+            "🧹 WIPE: <b>OFF</b>\n"
+            "⚡ AUTO WIPE: <b>OFF</b>\n\n"
+            "ℹ️ Use <code>/approvewipe CHAT_ID</code> "
+            "to enable WIPE."
         ),
         parse_mode=ParseMode.HTML,
     )
 
     logger.info(
-        "Chat approved manually: %s by %s",
+        "DUPE approved: %s by %s",
+        target_id,
+        user.id,
+    )
+
+
+# ============================================================
+# /APPROVEWIPE
+# ============================================================
+
+async def approvewipe_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not message or not chat:
+        return
+
+    if chat.id != LOG_CHAT_ID:
+        return
+
+    if not user or not is_bot_admin(user.id):
+        return
+
+    if not context.args:
+
+        await message.reply_text(
+            (
+                "⚠️ <b>APPROVEWIPE</b>\n\n"
+                "Use:\n"
+                "<code>/approvewipe -100XXXXXXXXXX</code>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+        return
+
+    try:
+
+        target_id = int(context.args[0])
+
+    except ValueError:
+
+        await message.reply_text(
+            "❌ Invalid Chat ID."
+        )
+
+        return
+
+    title, chat_type = await resolve_chat_info(
+        context,
+        target_id,
+    )
+
+    await save_wipe_approval(
+        target_id,
+        title,
+        user.id,
+    )
+
+    await message.reply_text(
+        (
+            "🧹 <b>WIPE APPROVED</b>\n\n"
+            "━━━━━━━━━━━━━━\n"
+            f"📌 Name: <b>{title}</b>\n"
+            f"🆔 <code>{target_id}</code>\n"
+            f"📂 Type: <b>{chat_type}</b>\n"
+            "━━━━━━━━━━━━━━\n\n"
+            "🧹 WIPE: <b>ENABLED</b>\n"
+            "⚡ AUTO WIPE: <b>ENABLED</b>\n"
+            f"🛡️ Keep: <b>{WIPE_KEEP}</b>\n"
+            f"⚡ Limit: <b>{AUTO_WIPE_LIMIT}</b>"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+    logger.info(
+        "WIPE approved: %s by %s",
         target_id,
         user.id,
     )
@@ -396,11 +465,14 @@ async def log_edit(
 ):
 
     try:
+
         await message.edit_text(
             text,
             parse_mode=ParseMode.HTML,
         )
+
     except Exception as e:
+
         logger.debug(
             "Log edit failed: %s",
             e,
@@ -439,6 +511,7 @@ def media_key(message):
         )
 
         if file_unique_id:
+
             return (
                 "document",
                 str(file_unique_id),
@@ -516,9 +589,7 @@ async def dclean_chat(
 
             scanned += 1
 
-            key = media_key(
-                message
-            )
+            key = media_key(message)
 
             if key is None:
                 continue
@@ -573,8 +644,7 @@ async def dclean_chat(
                     f"📌 Chat: <b>{title}</b>\n"
                     f"🆔 <code>{chat_id}</code>\n"
                     "━━━━━━━━━━━━━━\n\n"
-                    f"📨 Scanned: "
-                    f"<b>{scanned:,}</b>\n"
+                    f"📨 Scanned: <b>{scanned:,}</b>\n"
                     "♻️ Duplicates: <b>0</b>\n"
                     "🗑️ Deleted: <b>0</b>\n\n"
                     "✅ No duplicate files found."
@@ -583,9 +653,7 @@ async def dclean_chat(
 
             return
 
-        total = len(
-            duplicate_ids
-        )
+        total = len(duplicate_ids)
 
         await log_edit(
             log_message,
@@ -594,14 +662,10 @@ async def dclean_chat(
                 "━━━━━━━━━━━━━━\n"
                 f"📌 Chat: <b>{title}</b>\n"
                 "━━━━━━━━━━━━━━\n\n"
-                f"🔍 Scanned: "
-                f"<b>{scanned:,}</b>\n"
-                f"♻️ Duplicates: "
-                f"<b>{total:,}</b>\n"
-                f"🗑️ Deleted: "
-                f"<b>0</b>\n"
-                f"⏳ Remaining: "
-                f"<b>{total:,}</b>"
+                f"🔍 Scanned: <b>{scanned:,}</b>\n"
+                f"♻️ Duplicates: <b>{total:,}</b>\n"
+                "🗑️ Deleted: <b>0</b>\n"
+                f"⏳ Remaining: <b>{total:,}</b>"
             ),
         )
 
@@ -625,9 +689,7 @@ async def dclean_chat(
                         revoke=True,
                     )
 
-                    deleted += len(
-                        batch
-                    )
+                    deleted += len(batch)
 
                     break
 
@@ -638,16 +700,12 @@ async def dclean_chat(
                         (
                             "⏳ <b>TELEGRAM FLOOD WAIT</b>\n\n"
                             f"Waiting <b>{e.seconds}s</b>...\n\n"
-                            f"🗑️ Deleted: "
-                            f"<b>{deleted:,}</b>\n"
-                            f"⏳ Remaining: "
-                            f"<b>{total-deleted:,}</b>"
+                            f"🗑️ Deleted: <b>{deleted:,}</b>\n"
+                            f"⏳ Remaining: <b>{total-deleted:,}</b>"
                         ),
                     )
 
-                    await asyncio.sleep(
-                        e.seconds
-                    )
+                    await asyncio.sleep(e.seconds)
 
                 except RPCError as e:
 
@@ -656,9 +714,7 @@ async def dclean_chat(
                         e,
                     )
 
-                    failed += len(
-                        batch
-                    )
+                    failed += len(batch)
 
                     break
 
@@ -668,9 +724,7 @@ async def dclean_chat(
                         "Delete error"
                     )
 
-                    failed += len(
-                        batch
-                    )
+                    failed += len(batch)
 
                     break
 
@@ -686,22 +740,15 @@ async def dclean_chat(
                         "━━━━━━━━━━━━━━\n"
                         f"📌 Chat: <b>{title}</b>\n"
                         "━━━━━━━━━━━━━━\n\n"
-                        f"🔍 Scanned: "
-                        f"<b>{scanned:,}</b>\n"
-                        f"♻️ Duplicates: "
-                        f"<b>{total:,}</b>\n"
-                        f"🗑️ Deleted: "
-                        f"<b>{deleted:,}</b>\n"
-                        f"❌ Failed: "
-                        f"<b>{failed:,}</b>\n"
-                        f"⏳ Remaining: "
-                        f"<b>{max(total-deleted,0):,}</b>"
+                        f"🔍 Scanned: <b>{scanned:,}</b>\n"
+                        f"♻️ Duplicates: <b>{total:,}</b>\n"
+                        f"🗑️ Deleted: <b>{deleted:,}</b>\n"
+                        f"❌ Failed: <b>{failed:,}</b>\n"
+                        f"⏳ Remaining: <b>{max(total-deleted,0):,}</b>"
                     ),
                 )
 
-            await asyncio.sleep(
-                DELETE_PAUSE
-            )
+            await asyncio.sleep(DELETE_PAUSE)
 
         await log_edit(
             log_message,
@@ -711,23 +758,17 @@ async def dclean_chat(
                 f"📌 Chat: <b>{title}</b>\n"
                 f"🆔 <code>{chat_id}</code>\n"
                 "━━━━━━━━━━━━━━\n\n"
-                f"📨 Scanned: "
-                f"<b>{scanned:,}</b>\n"
-                f"♻️ Duplicates: "
-                f"<b>{total:,}</b>\n"
-                f"🗑️ Deleted: "
-                f"<b>{deleted:,}</b>\n"
-                f"❌ Failed: "
-                f"<b>{failed:,}</b>\n\n"
+                f"📨 Scanned: <b>{scanned:,}</b>\n"
+                f"♻️ Duplicates: <b>{total:,}</b>\n"
+                f"🗑️ Deleted: <b>{deleted:,}</b>\n"
+                f"❌ Failed: <b>{failed:,}</b>\n\n"
                 "✅ Duplicate files removed."
             ),
         )
 
     except Exception as e:
 
-        logger.exception(
-            "DCLEAN failed"
-        )
+        logger.exception("DCLEAN failed")
 
         await log_edit(
             log_message,
@@ -758,9 +799,7 @@ async def dclean_command(
     if chat.id != LOG_CHAT_ID:
         return
 
-    if not user or not is_bot_admin(
-        user.id
-    ):
+    if not user or not is_bot_admin(user.id):
         return
 
     if not context.args:
@@ -775,9 +814,7 @@ async def dclean_command(
 
     try:
 
-        target_id = int(
-            context.args[0]
-        )
+        target_id = int(context.args[0])
 
     except ValueError:
 
@@ -787,25 +824,20 @@ async def dclean_command(
 
         return
 
-    if not await is_approved(
-        target_id
-    ):
+    if not await is_dupe_approved(target_id):
 
         await message.reply_text(
-            "❌ This chat is not approved."
+            "❌ Duplicate cleaning is not approved for this chat."
         )
 
         return
 
-    old = dclean_tasks.get(
-        target_id
-    )
+    old = dclean_tasks.get(target_id)
 
     if old and not old.done():
 
         await message.reply_text(
-            "⚠️ DCLEAN is already running "
-            "for this chat."
+            "⚠️ DCLEAN is already running for this chat."
         )
 
         return
@@ -824,9 +856,7 @@ async def dclean_command(
         )
     )
 
-    dclean_tasks[
-        target_id
-    ] = task
+    dclean_tasks[target_id] = task
 
 
 # ============================================================
@@ -843,9 +873,7 @@ async def wipe_chat(
 
     try:
 
-        entity = await get_entity(
-            chat_id
-        )
+        entity = await get_entity(chat_id)
 
         title = getattr(
             entity,
@@ -878,9 +906,7 @@ async def wipe_chat(
             if total <= WIPE_KEEP:
                 continue
 
-            ids.append(
-                msg.id
-            )
+            ids.append(msg.id)
 
             if len(ids) >= DELETE_BATCH:
 
@@ -894,17 +920,12 @@ async def wipe_chat(
                             revoke=True,
                         )
 
-                        deleted += len(
-                            ids
-                        )
-
+                        deleted += len(ids)
                         ids.clear()
 
                     except FloodWaitError as e:
 
-                        await asyncio.sleep(
-                            e.seconds
-                        )
+                        await asyncio.sleep(e.seconds)
 
                     except Exception:
 
@@ -915,12 +936,9 @@ async def wipe_chat(
                     (
                         "🧹 <b>WIPE PROGRESS</b>\n\n"
                         f"📌 <b>{title}</b>\n\n"
-                        f"📨 Found: "
-                        f"<b>{total:,}</b>\n"
-                        f"🗑️ Deleted: "
-                        f"<b>{deleted:,}</b>\n"
-                        f"🛡️ Keep: "
-                        f"<b>{WIPE_KEEP}</b>"
+                        f"📨 Found: <b>{total:,}</b>\n"
+                        f"🗑️ Deleted: <b>{deleted:,}</b>\n"
+                        f"🛡️ Keep: <b>{WIPE_KEEP}</b>"
                     ),
                 )
 
@@ -934,15 +952,11 @@ async def wipe_chat(
                     revoke=True,
                 )
 
-                deleted += len(
-                    ids
-                )
+                deleted += len(ids)
 
             except FloodWaitError as e:
 
-                await asyncio.sleep(
-                    e.seconds
-                )
+                await asyncio.sleep(e.seconds)
 
                 try:
 
@@ -952,9 +966,7 @@ async def wipe_chat(
                         revoke=True,
                     )
 
-                    deleted += len(
-                        ids
-                    )
+                    deleted += len(ids)
 
                 except Exception:
                     pass
@@ -979,9 +991,7 @@ async def wipe_chat(
 
     except Exception as e:
 
-        logger.exception(
-            "WIPE failed"
-        )
+        logger.exception("WIPE failed")
 
         await log_edit(
             log_message,
@@ -1012,9 +1022,7 @@ async def wipe_command(
     if chat.id != LOG_CHAT_ID:
         return
 
-    if not user or not is_bot_admin(
-        user.id
-    ):
+    if not user or not is_bot_admin(user.id):
         return
 
     if not context.args:
@@ -1029,9 +1037,7 @@ async def wipe_command(
 
     try:
 
-        target_id = int(
-            context.args[0]
-        )
+        target_id = int(context.args[0])
 
     except ValueError:
 
@@ -1041,19 +1047,15 @@ async def wipe_command(
 
         return
 
-    if not await is_approved(
-        target_id
-    ):
+    if not await is_wipe_approved(target_id):
 
         await message.reply_text(
-            "❌ This chat is not approved."
+            "❌ WIPE is not approved for this chat."
         )
 
         return
 
-    old = wipe_tasks.get(
-        target_id
-    )
+    old = wipe_tasks.get(target_id)
 
     if old and not old.done():
 
@@ -1077,9 +1079,7 @@ async def wipe_command(
         )
     )
 
-    wipe_tasks[
-        target_id
-    ] = task
+    wipe_tasks[target_id] = task
 
 
 # ============================================================
@@ -1090,9 +1090,12 @@ async def auto_wipe_check(
     chat_id: int,
 ):
 
-    if not await is_approved(
-        chat_id
-    ):
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # AUTO WIPE ONLY IF WIPE APPROVED
+    # --------------------------------------------------------
+
+    if not await is_wipe_approved(chat_id):
         return
 
     lock = auto_wipe_locks.setdefault(
@@ -1107,9 +1110,7 @@ async def auto_wipe_check(
 
         try:
 
-            entity = await get_entity(
-                chat_id
-            )
+            entity = await get_entity(chat_id)
 
             count = 0
 
@@ -1133,10 +1134,8 @@ async def auto_wipe_check(
                     (
                         "⚡ <b>AUTO WIPE STARTED</b>\n\n"
                         f"🆔 <code>{chat_id}</code>\n"
-                        f"📨 Threshold: "
-                        f"<b>{AUTO_WIPE_LIMIT}</b>\n"
-                        f"🛡️ Keep: "
-                        f"<b>{WIPE_KEEP}</b>"
+                        f"📨 Threshold: <b>{AUTO_WIPE_LIMIT}</b>\n"
+                        f"🛡️ Keep: <b>{WIPE_KEEP}</b>"
                     ),
                     parse_mode=ParseMode.HTML,
                 )
@@ -1144,16 +1143,12 @@ async def auto_wipe_check(
             except Exception:
                 return
 
-            old = wipe_tasks.get(
-                chat_id
-            )
+            old = wipe_tasks.get(chat_id)
 
             if old and not old.done():
                 return
 
-            wipe_tasks[
-                chat_id
-            ] = asyncio.create_task(
+            wipe_tasks[chat_id] = asyncio.create_task(
                 wipe_chat(
                     chat_id,
                     log_message,
@@ -1169,7 +1164,7 @@ async def auto_wipe_check(
 
 
 # ============================================================
-# TELEGRAM BOT OBJECT FOR AUTO WIPE
+# TELEGRAM BOT OBJECT
 # ============================================================
 
 tg_bot = None
@@ -1201,14 +1196,14 @@ async def message_watcher(
     ):
         return
 
-    if not await is_approved(
-        chat.id
-    ):
+    # --------------------------------------------------------
+    # ONLY WIPE-APPROVED CHATS CAN AUTO WIPE
+    # --------------------------------------------------------
+
+    if not await is_wipe_approved(chat.id):
         return
 
-    await auto_wipe_check(
-        chat.id
-    )
+    await auto_wipe_check(chat.id)
 
 
 # ============================================================
@@ -1249,8 +1244,9 @@ async def bot_membership_update(
     if not now or was:
         return
 
-    if await is_approved(
-        chat.id
+    if (
+        await is_wipe_approved(chat.id)
+        or await is_dupe_approved(chat.id)
     ):
         return
 
@@ -1261,9 +1257,7 @@ async def bot_membership_update(
 
     added_by = change.from_user
 
-    pending_approvals[
-        chat.id
-    ] = {
+    pending_approvals[chat.id] = {
         "title": title,
         "added_by": (
             added_by.id
@@ -1276,15 +1270,15 @@ async def bot_membership_update(
         [
             [
                 InlineKeyboardButton(
-                    "✅ APPROVE",
+                    "♻️ DUPE",
                     callback_data=(
-                        f"approve:{chat.id}"
+                        f"approvedupe:{chat.id}"
                     ),
                 ),
                 InlineKeyboardButton(
-                    "❌ REJECT",
+                    "🧹 WIPE",
                     callback_data=(
-                        f"reject:{chat.id}"
+                        f"approvewipe:{chat.id}"
                     ),
                 ),
             ]
@@ -1299,8 +1293,7 @@ async def bot_membership_update(
             f"📌 Group: <b>{title}</b>\n"
             f"🆔 <code>{chat.id}</code>\n"
             "━━━━━━━━━━━━━━\n\n"
-            "⚠️ This group is NOT approved yet.\n\n"
-            "Approve this group?"
+            "Choose approval type:"
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
@@ -1323,9 +1316,7 @@ async def callback_handler(
 
     user = query.from_user
 
-    if not user or not is_bot_admin(
-        user.id
-    ):
+    if not user or not is_bot_admin(user.id):
 
         await query.answer(
             "❌ Not authorized",
@@ -1338,20 +1329,17 @@ async def callback_handler(
 
     data = query.data
 
-    if data.startswith(
-        "approve:"
-    ):
+    # --------------------------------------------------------
+    # DUPE APPROVE
+    # --------------------------------------------------------
+
+    if data.startswith("approvedupe:"):
 
         chat_id = int(
-            data.split(
-                ":",
-                1,
-            )[1]
+            data.split(":", 1)[1]
         )
 
-        pending = pending_approvals.get(
-            chat_id
-        )
+        pending = pending_approvals.get(chat_id)
 
         title = (
             pending["title"]
@@ -1359,7 +1347,7 @@ async def callback_handler(
             else "Unknown"
         )
 
-        await save_approval(
+        await save_dupe_approval(
             chat_id,
             title,
             user.id,
@@ -1372,30 +1360,29 @@ async def callback_handler(
 
         await query.edit_message_text(
             (
-                "✅ <b>GROUP APPROVED</b>\n\n"
+                "♻️ <b>DUPLICATE CLEAN APPROVED</b>\n\n"
                 f"📌 <b>{title}</b>\n"
                 f"🆔 <code>{chat_id}</code>\n\n"
-                "🟢 DCLEAN and WIPE enabled."
+                "♻️ DCLEAN: <b>ON</b>\n"
+                "🧹 WIPE: <b>OFF</b>\n"
+                "⚡ AUTO WIPE: <b>OFF</b>"
             ),
             parse_mode=ParseMode.HTML,
         )
 
         return
 
-    if data.startswith(
-        "reject:"
-    ):
+    # --------------------------------------------------------
+    # WIPE APPROVE
+    # --------------------------------------------------------
+
+    if data.startswith("approvewipe:"):
 
         chat_id = int(
-            data.split(
-                ":",
-                1,
-            )[1]
+            data.split(":", 1)[1]
         )
 
-        pending = pending_approvals.get(
-            chat_id
-        )
+        pending = pending_approvals.get(chat_id)
 
         title = (
             pending["title"]
@@ -1403,8 +1390,10 @@ async def callback_handler(
             else "Unknown"
         )
 
-        await reject_approval(
-            chat_id
+        await save_wipe_approval(
+            chat_id,
+            title,
+            user.id,
         )
 
         pending_approvals.pop(
@@ -1414,9 +1403,12 @@ async def callback_handler(
 
         await query.edit_message_text(
             (
-                "❌ <b>GROUP REJECTED</b>\n\n"
+                "🧹 <b>WIPE APPROVED</b>\n\n"
                 f"📌 <b>{title}</b>\n"
-                f"🆔 <code>{chat_id}</code>"
+                f"🆔 <code>{chat_id}</code>\n\n"
+                "🧹 WIPE: <b>ON</b>\n"
+                "⚡ AUTO WIPE: <b>ON</b>\n"
+                "♻️ DCLEAN: <b>OFF</b>"
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -1435,23 +1427,25 @@ async def start(
 
     user = update.effective_user
 
-    if not user or not is_bot_admin(
-        user.id
-    ):
+    if not user or not is_bot_admin(user.id):
         return
 
     await update.effective_message.reply_text(
-        "🧹 <b>WIPE + DUPLICATE CLEANER</b>\n\n"
-        "━━━━━━━━━━━━━━\n"
-        "♻️ Duplicate Clean:\n"
-        "<code>/dclean CHAT_ID</code>\n\n"
-        "⚡ Wipe:\n"
-        "<code>/wipe CHAT_ID</code>\n\n"
-        "✅ Approve:\n"
-        "<code>/approve CHAT_ID</code>\n"
-        "━━━━━━━━━━━━━━\n\n"
-        f"🛡️ Wipe Keep: <b>{WIPE_KEEP}</b>\n"
-        f"⚡ Auto Wipe: <b>{AUTO_WIPE_LIMIT}</b> messages",
+        (
+            "🧹 <b>WIPE + DUPLICATE CLEANER</b>\n\n"
+            "━━━━━━━━━━━━━━\n"
+            "♻️ Duplicate approval:\n"
+            "<code>/approvedupe CHAT_ID</code>\n\n"
+            "🧹 Wipe approval:\n"
+            "<code>/approvewipe CHAT_ID</code>\n\n"
+            "♻️ Duplicate Clean:\n"
+            "<code>/dclean CHAT_ID</code>\n\n"
+            "⚡ Wipe:\n"
+            "<code>/wipe CHAT_ID</code>\n"
+            "━━━━━━━━━━━━━━\n\n"
+            f"🛡️ Wipe Keep: <b>{WIPE_KEEP}</b>\n"
+            f"⚡ Auto Wipe: <b>{AUTO_WIPE_LIMIT}</b> messages"
+        ),
         parse_mode=ParseMode.HTML,
     )
 
@@ -1512,10 +1506,7 @@ def main():
         .build()
     )
 
-    # --------------------------------------------------------
     # START
-    # --------------------------------------------------------
-
     application.add_handler(
         CommandHandler(
             "start",
@@ -1523,23 +1514,23 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # APPROVE
-    # IMPORTANT:
-    # /approve works only inside LOG_CHAT_ID
-    # --------------------------------------------------------
-
+    # APPROVE DUPE
     application.add_handler(
         CommandHandler(
-            "approve",
-            approve_command,
+            "approvedupe",
+            approvedupe_command,
         )
     )
 
-    # --------------------------------------------------------
-    # DCLEAN
-    # --------------------------------------------------------
+    # APPROVE WIPE
+    application.add_handler(
+        CommandHandler(
+            "approvewipe",
+            approvewipe_command,
+        )
+    )
 
+    # DCLEAN
     application.add_handler(
         CommandHandler(
             "dclean",
@@ -1547,10 +1538,7 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
     # WIPE
-    # --------------------------------------------------------
-
     application.add_handler(
         CommandHandler(
             "wipe",
@@ -1558,10 +1546,7 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
     # BOT MEMBERSHIP
-    # --------------------------------------------------------
-
     application.add_handler(
         ChatMemberHandler(
             bot_membership_update,
@@ -1569,20 +1554,14 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
     # CALLBACK
-    # --------------------------------------------------------
-
     application.add_handler(
         CallbackQueryHandler(
             callback_handler
         )
     )
 
-    # --------------------------------------------------------
     # MESSAGE WATCHER
-    # --------------------------------------------------------
-
     from telegram.ext import MessageHandler, filters
 
     application.add_handler(
