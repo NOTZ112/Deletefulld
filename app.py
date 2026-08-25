@@ -91,6 +91,10 @@ db = mongo["duplicate_cleaner"]
 
 approved_groups = db["approved_groups"]
 
+# Incremental DCLEAN storage
+dclean_state = db["dclean_state"]
+media_fingerprints = db["media_fingerprints"]
+
 
 # ============================================================
 # TELETHON
@@ -539,7 +543,75 @@ def media_key(message):
 
 
 # ============================================================
-# D CLEAN
+# INCREMENTAL DCLEAN HELPERS
+# ============================================================
+
+async def get_last_scanned_id(chat_id: int) -> int:
+
+    row = await dclean_state.find_one(
+        {"_id": int(chat_id)}
+    )
+
+    if not row:
+        return 0
+
+    return int(
+        row.get("last_message_id", 0)
+    )
+
+
+async def save_last_scanned_id(
+    chat_id: int,
+    message_id: int,
+):
+
+    await dclean_state.update_one(
+        {"_id": int(chat_id)},
+        {
+            "$set": {
+                "last_message_id": int(message_id),
+            }
+        },
+        upsert=True,
+    )
+
+
+async def save_fingerprint(
+    chat_id: int,
+    media_type: str,
+    fingerprint: str,
+    message_id: int,
+):
+
+    try:
+
+        await media_fingerprints.update_one(
+            {
+                "chat_id": int(chat_id),
+                "media_type": str(media_type),
+                "fingerprint": str(fingerprint),
+            },
+            {
+                "$setOnInsert": {
+                    "chat_id": int(chat_id),
+                    "media_type": str(media_type),
+                    "fingerprint": str(fingerprint),
+                    "message_id": int(message_id),
+                }
+            },
+            upsert=True,
+        )
+
+    except Exception as e:
+
+        logger.warning(
+            "Fingerprint save failed: %s",
+            e,
+        )
+
+
+# ============================================================
+# D CLEAN — INCREMENTAL
 # ============================================================
 
 async def dclean_chat(
@@ -554,7 +626,9 @@ async def dclean_chat(
 
     duplicate_ids = []
 
-    seen: Set[tuple] = set()
+    last_scanned_id = await get_last_scanned_id(
+        chat_id
+    )
 
     try:
 
@@ -568,33 +642,114 @@ async def dclean_chat(
             str(chat_id),
         )
 
-        await log_edit(
-            log_message,
-            (
-                "🧹 <b>DCLEAN STARTED</b>\n\n"
+        if last_scanned_id == 0:
+
+            scan_text = (
+                "🔍 <b>FIRST DCLEAN SCAN</b>\n\n"
                 "━━━━━━━━━━━━━━\n"
                 f"📌 Chat: <b>{title}</b>\n"
                 f"🆔 <code>{chat_id}</code>\n"
                 "━━━━━━━━━━━━━━\n\n"
-                "🔍 Scanning history..."
-            ),
+                "📦 Scanning complete history..."
+            )
+
+        else:
+
+            scan_text = (
+                "⚡ <b>INCREMENTAL DCLEAN</b>\n\n"
+                "━━━━━━━━━━━━━━\n"
+                f"📌 Chat: <b>{title}</b>\n"
+                f"🆔 <code>{chat_id}</code>\n"
+                "━━━━━━━━━━━━━━\n\n"
+                f"📍 Last scanned ID: "
+                f"<code>{last_scanned_id}</code>\n\n"
+                "🔍 Scanning only new messages..."
+            )
+
+        await log_edit(
+            log_message,
+            scan_text,
         )
 
-        last_progress = 0
+        # ----------------------------------------------------
+        # LOAD STORED FINGERPRINTS
+        # ----------------------------------------------------
+
+        seen: Set[tuple] = set()
+
+        cursor = media_fingerprints.find(
+            {"chat_id": int(chat_id)},
+            {
+                "media_type": 1,
+                "fingerprint": 1,
+                "_id": 0,
+            },
+        )
+
+        async for row in cursor:
+
+            media_type = row.get(
+                "media_type"
+            )
+
+            fingerprint = row.get(
+                "fingerprint"
+            )
+
+            if media_type and fingerprint:
+
+                seen.add(
+                    (
+                        str(media_type),
+                        str(fingerprint),
+                    )
+                )
+
+        # ----------------------------------------------------
+        # SCAN
+        # ----------------------------------------------------
+
+        message_kwargs = {
+            "entity": entity,
+            "reverse": True,
+        }
+
+        if last_scanned_id > 0:
+
+            message_kwargs["min_id"] = (
+                last_scanned_id
+            )
+
+        max_message_id = last_scanned_id
 
         async for message in tg.iter_messages(
-            entity,
-            reverse=True,
+            **message_kwargs
         ):
 
             scanned += 1
 
-            key = media_key(message)
+            if message.id > max_message_id:
+                max_message_id = message.id
+
+            key = media_key(
+                message
+            )
 
             if key is None:
                 continue
 
-            if key in seen:
+            media_type, media_id = key
+
+            fingerprint = str(
+                media_id
+            )
+
+            fingerprint_key = (
+                str(media_type),
+                fingerprint,
+            )
+
+            if fingerprint_key in seen:
 
                 duplicate_ids.append(
                     message.id
@@ -604,41 +759,57 @@ async def dclean_chat(
 
             else:
 
-                seen.add(key)
+                seen.add(
+                    fingerprint_key
+                )
 
-            if (
-                scanned - last_progress
-                >= PROGRESS_EVERY
-            ):
+                await save_fingerprint(
+                    chat_id,
+                    media_type,
+                    fingerprint,
+                    message.id,
+                )
 
-                last_progress = scanned
+            if scanned % PROGRESS_EVERY == 0:
 
                 await log_edit(
                     log_message,
                     (
-                        "🧹 <b>DCLEAN</b>\n\n"
+                        "🧹 <b>DCLEAN SCANNING</b>\n\n"
                         "━━━━━━━━━━━━━━\n"
                         f"📌 Chat: <b>{title}</b>\n"
-                        f"🆔 <code>{chat_id}</code>\n"
                         "━━━━━━━━━━━━━━\n\n"
-                        f"🔍 Scanned: "
+                        f"🔍 New Scanned: "
                         f"<b>{scanned:,}</b>\n"
                         f"♻️ Duplicates: "
                         f"<b>{duplicates:,}</b>\n"
-                        f"🗑️ Deleted: "
-                        f"<b>{deleted:,}</b>\n"
-                        f"⏳ Remaining: "
-                        f"<b>{len(duplicate_ids):,}</b>"
+                        f"🆔 Last ID: "
+                        f"<code>{max_message_id}</code>"
                     ),
                 )
 
                 await asyncio.sleep(0)
 
+        # ----------------------------------------------------
+        # SAVE PROGRESS
+        # ----------------------------------------------------
+
+        if max_message_id > last_scanned_id:
+
+            await save_last_scanned_id(
+                chat_id,
+                max_message_id,
+            )
+
+        # ----------------------------------------------------
+        # NO DUPLICATES
+        # ----------------------------------------------------
+
         if not duplicate_ids:
 
-            await log_edit(
-                log_message,
-                (
+            if last_scanned_id == 0:
+
+                text = (
                     "✅ <b>DCLEAN COMPLETED</b>\n\n"
                     "━━━━━━━━━━━━━━\n"
                     f"📌 Chat: <b>{title}</b>\n"
@@ -647,13 +818,41 @@ async def dclean_chat(
                     f"📨 Scanned: <b>{scanned:,}</b>\n"
                     "♻️ Duplicates: <b>0</b>\n"
                     "🗑️ Deleted: <b>0</b>\n\n"
-                    "✅ No duplicate files found."
-                ),
+                    "✅ No duplicate files found.\n\n"
+                    f"💾 Last Message ID:\n"
+                    f"<code>{max_message_id}</code>"
+                )
+
+            else:
+
+                text = (
+                    "⚡ <b>INCREMENTAL DCLEAN COMPLETED</b>\n\n"
+                    "━━━━━━━━━━━━━━\n"
+                    f"📌 Chat: <b>{title}</b>\n"
+                    f"🆔 <code>{chat_id}</code>\n"
+                    "━━━━━━━━━━━━━━\n\n"
+                    f"📨 New Messages: <b>{scanned:,}</b>\n"
+                    "♻️ New Duplicates: <b>0</b>\n"
+                    "🗑️ Deleted: <b>0</b>\n\n"
+                    "✅ No new duplicate files found.\n\n"
+                    f"💾 Last Message ID:\n"
+                    f"<code>{max_message_id}</code>"
+                )
+
+            await log_edit(
+                log_message,
+                text,
             )
 
             return
 
-        total = len(duplicate_ids)
+        # ----------------------------------------------------
+        # DELETE DUPLICATES
+        # ----------------------------------------------------
+
+        total = len(
+            duplicate_ids
+        )
 
         await log_edit(
             log_message,
@@ -662,7 +861,7 @@ async def dclean_chat(
                 "━━━━━━━━━━━━━━\n"
                 f"📌 Chat: <b>{title}</b>\n"
                 "━━━━━━━━━━━━━━\n\n"
-                f"🔍 Scanned: <b>{scanned:,}</b>\n"
+                f"🔍 New Scanned: <b>{scanned:,}</b>\n"
                 f"♻️ Duplicates: <b>{total:,}</b>\n"
                 "🗑️ Deleted: <b>0</b>\n"
                 f"⏳ Remaining: <b>{total:,}</b>"
@@ -689,7 +888,9 @@ async def dclean_chat(
                         revoke=True,
                     )
 
-                    deleted += len(batch)
+                    deleted += len(
+                        batch
+                    )
 
                     break
 
@@ -700,12 +901,16 @@ async def dclean_chat(
                         (
                             "⏳ <b>TELEGRAM FLOOD WAIT</b>\n\n"
                             f"Waiting <b>{e.seconds}s</b>...\n\n"
-                            f"🗑️ Deleted: <b>{deleted:,}</b>\n"
-                            f"⏳ Remaining: <b>{total-deleted:,}</b>"
+                            f"🗑️ Deleted: "
+                            f"<b>{deleted:,}</b>\n"
+                            f"⏳ Remaining: "
+                            f"<b>{total-deleted:,}</b>"
                         ),
                     )
 
-                    await asyncio.sleep(e.seconds)
+                    await asyncio.sleep(
+                        e.seconds
+                    )
 
                 except RPCError as e:
 
@@ -714,17 +919,22 @@ async def dclean_chat(
                         e,
                     )
 
-                    failed += len(batch)
+                    failed += len(
+                        batch
+                    )
 
                     break
 
                 except Exception as e:
 
                     logger.exception(
-                        "Delete error"
+                        "Delete error: %s",
+                        e,
                     )
 
-                    failed += len(batch)
+                    failed += len(
+                        batch
+                    )
 
                     break
 
@@ -744,11 +954,14 @@ async def dclean_chat(
                         f"♻️ Duplicates: <b>{total:,}</b>\n"
                         f"🗑️ Deleted: <b>{deleted:,}</b>\n"
                         f"❌ Failed: <b>{failed:,}</b>\n"
-                        f"⏳ Remaining: <b>{max(total-deleted,0):,}</b>"
+                        f"⏳ Remaining: "
+                        f"<b>{max(total-deleted,0):,}</b>"
                     ),
                 )
 
-            await asyncio.sleep(DELETE_PAUSE)
+            await asyncio.sleep(
+                DELETE_PAUSE
+            )
 
         await log_edit(
             log_message,
@@ -758,17 +971,21 @@ async def dclean_chat(
                 f"📌 Chat: <b>{title}</b>\n"
                 f"🆔 <code>{chat_id}</code>\n"
                 "━━━━━━━━━━━━━━\n\n"
-                f"📨 Scanned: <b>{scanned:,}</b>\n"
+                f"📨 New Scanned: <b>{scanned:,}</b>\n"
                 f"♻️ Duplicates: <b>{total:,}</b>\n"
                 f"🗑️ Deleted: <b>{deleted:,}</b>\n"
                 f"❌ Failed: <b>{failed:,}</b>\n\n"
+                f"💾 Last Message ID:\n"
+                f"<code>{max_message_id}</code>\n\n"
                 "✅ Duplicate files removed."
             ),
         )
 
     except Exception as e:
 
-        logger.exception("DCLEAN failed")
+        logger.exception(
+            "Incremental DCLEAN failed"
+        )
 
         await log_edit(
             log_message,
@@ -814,7 +1031,9 @@ async def dclean_command(
 
     try:
 
-        target_id = int(context.args[0])
+        target_id = int(
+            context.args[0]
+        )
 
     except ValueError:
 
@@ -824,7 +1043,9 @@ async def dclean_command(
 
         return
 
-    if not await is_dupe_approved(target_id):
+    if not await is_dupe_approved(
+        target_id
+    ):
 
         await message.reply_text(
             "❌ Duplicate cleaning is not approved for this chat."
@@ -832,7 +1053,9 @@ async def dclean_command(
 
         return
 
-    old = dclean_tasks.get(target_id)
+    old = dclean_tasks.get(
+        target_id
+    )
 
     if old and not old.done():
 
@@ -856,7 +1079,9 @@ async def dclean_command(
         )
     )
 
-    dclean_tasks[target_id] = task
+    dclean_tasks[
+        target_id
+    ] = task
 
 
 # ============================================================
@@ -873,7 +1098,9 @@ async def wipe_chat(
 
     try:
 
-        entity = await get_entity(chat_id)
+        entity = await get_entity(
+            chat_id
+        )
 
         title = getattr(
             entity,
@@ -906,7 +1133,9 @@ async def wipe_chat(
             if total <= WIPE_KEEP:
                 continue
 
-            ids.append(msg.id)
+            ids.append(
+                msg.id
+            )
 
             if len(ids) >= DELETE_BATCH:
 
@@ -920,12 +1149,17 @@ async def wipe_chat(
                             revoke=True,
                         )
 
-                        deleted += len(ids)
+                        deleted += len(
+                            ids
+                        )
+
                         ids.clear()
 
                     except FloodWaitError as e:
 
-                        await asyncio.sleep(e.seconds)
+                        await asyncio.sleep(
+                            e.seconds
+                        )
 
                     except Exception:
 
@@ -952,11 +1186,15 @@ async def wipe_chat(
                     revoke=True,
                 )
 
-                deleted += len(ids)
+                deleted += len(
+                    ids
+                )
 
             except FloodWaitError as e:
 
-                await asyncio.sleep(e.seconds)
+                await asyncio.sleep(
+                    e.seconds
+                )
 
                 try:
 
@@ -966,7 +1204,9 @@ async def wipe_chat(
                         revoke=True,
                     )
 
-                    deleted += len(ids)
+                    deleted += len(
+                        ids
+                    )
 
                 except Exception:
                     pass
@@ -991,7 +1231,9 @@ async def wipe_chat(
 
     except Exception as e:
 
-        logger.exception("WIPE failed")
+        logger.exception(
+            "WIPE failed"
+        )
 
         await log_edit(
             log_message,
@@ -1022,7 +1264,9 @@ async def wipe_command(
     if chat.id != LOG_CHAT_ID:
         return
 
-    if not user or not is_bot_admin(user.id):
+    if not user or not is_bot_admin(
+        user.id
+    ):
         return
 
     if not context.args:
@@ -1037,7 +1281,9 @@ async def wipe_command(
 
     try:
 
-        target_id = int(context.args[0])
+        target_id = int(
+            context.args[0]
+        )
 
     except ValueError:
 
@@ -1047,7 +1293,9 @@ async def wipe_command(
 
         return
 
-    if not await is_wipe_approved(target_id):
+    if not await is_wipe_approved(
+        target_id
+    ):
 
         await message.reply_text(
             "❌ WIPE is not approved for this chat."
@@ -1055,7 +1303,9 @@ async def wipe_command(
 
         return
 
-    old = wipe_tasks.get(target_id)
+    old = wipe_tasks.get(
+        target_id
+    )
 
     if old and not old.done():
 
@@ -1079,7 +1329,9 @@ async def wipe_command(
         )
     )
 
-    wipe_tasks[target_id] = task
+    wipe_tasks[
+        target_id
+    ] = task
 
 
 # ============================================================
@@ -1090,12 +1342,9 @@ async def auto_wipe_check(
     chat_id: int,
 ):
 
-    # --------------------------------------------------------
-    # IMPORTANT:
-    # AUTO WIPE ONLY IF WIPE APPROVED
-    # --------------------------------------------------------
-
-    if not await is_wipe_approved(chat_id):
+    if not await is_wipe_approved(
+        chat_id
+    ):
         return
 
     lock = auto_wipe_locks.setdefault(
@@ -1110,7 +1359,9 @@ async def auto_wipe_check(
 
         try:
 
-            entity = await get_entity(chat_id)
+            entity = await get_entity(
+                chat_id
+            )
 
             count = 0
 
@@ -1143,12 +1394,16 @@ async def auto_wipe_check(
             except Exception:
                 return
 
-            old = wipe_tasks.get(chat_id)
+            old = wipe_tasks.get(
+                chat_id
+            )
 
             if old and not old.done():
                 return
 
-            wipe_tasks[chat_id] = asyncio.create_task(
+            wipe_tasks[
+                chat_id
+            ] = asyncio.create_task(
                 wipe_chat(
                     chat_id,
                     log_message,
@@ -1196,14 +1451,14 @@ async def message_watcher(
     ):
         return
 
-    # --------------------------------------------------------
-    # ONLY WIPE-APPROVED CHATS CAN AUTO WIPE
-    # --------------------------------------------------------
-
-    if not await is_wipe_approved(chat.id):
+    if not await is_wipe_approved(
+        chat.id
+    ):
         return
 
-    await auto_wipe_check(chat.id)
+    await auto_wipe_check(
+        chat.id
+    )
 
 
 # ============================================================
@@ -1245,8 +1500,12 @@ async def bot_membership_update(
         return
 
     if (
-        await is_wipe_approved(chat.id)
-        or await is_dupe_approved(chat.id)
+        await is_wipe_approved(
+            chat.id
+        )
+        or await is_dupe_approved(
+            chat.id
+        )
     ):
         return
 
@@ -1257,7 +1516,9 @@ async def bot_membership_update(
 
     added_by = change.from_user
 
-    pending_approvals[chat.id] = {
+    pending_approvals[
+        chat.id
+    ] = {
         "title": title,
         "added_by": (
             added_by.id
@@ -1316,7 +1577,9 @@ async def callback_handler(
 
     user = query.from_user
 
-    if not user or not is_bot_admin(user.id):
+    if not user or not is_bot_admin(
+        user.id
+    ):
 
         await query.answer(
             "❌ Not authorized",
@@ -1329,17 +1592,20 @@ async def callback_handler(
 
     data = query.data
 
-    # --------------------------------------------------------
-    # DUPE APPROVE
-    # --------------------------------------------------------
-
-    if data.startswith("approvedupe:"):
+    if data.startswith(
+        "approvedupe:"
+    ):
 
         chat_id = int(
-            data.split(":", 1)[1]
+            data.split(
+                ":",
+                1,
+            )[1]
         )
 
-        pending = pending_approvals.get(chat_id)
+        pending = pending_approvals.get(
+            chat_id
+        )
 
         title = (
             pending["title"]
@@ -1372,17 +1638,20 @@ async def callback_handler(
 
         return
 
-    # --------------------------------------------------------
-    # WIPE APPROVE
-    # --------------------------------------------------------
-
-    if data.startswith("approvewipe:"):
+    if data.startswith(
+        "approvewipe:"
+    ):
 
         chat_id = int(
-            data.split(":", 1)[1]
+            data.split(
+                ":",
+                1,
+            )[1]
         )
 
-        pending = pending_approvals.get(chat_id)
+        pending = pending_approvals.get(
+            chat_id
+        )
 
         title = (
             pending["title"]
@@ -1427,7 +1696,9 @@ async def start(
 
     user = update.effective_user
 
-    if not user or not is_bot_admin(user.id):
+    if not user or not is_bot_admin(
+        user.id
+    ):
         return
 
     await update.effective_message.reply_text(
@@ -1463,6 +1734,30 @@ async def post_init(
     tg_bot = application.bot
 
     await ensure_tg()
+
+    # Incremental DCLEAN indexes
+    try:
+
+        await dclean_state.create_index(
+            [("_id", 1)],
+            unique=True,
+        )
+
+        await media_fingerprints.create_index(
+            [
+                ("chat_id", 1),
+                ("media_type", 1),
+                ("fingerprint", 1),
+            ],
+            unique=True,
+        )
+
+    except Exception as e:
+
+        logger.warning(
+            "Incremental index setup warning: %s",
+            e,
+        )
 
     me = await tg.get_me()
 
