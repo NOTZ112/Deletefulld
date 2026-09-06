@@ -44,6 +44,11 @@ PIPE_LOG_CHAT_ID = os.getenv("PIPE_LOG_CHAT_ID", "")
 
 DB_NAME = "duplicate_cleaner"
 
+
+# ============================================================
+# ADMIN IDS
+# ============================================================
+
 ADMIN_IDS = {
     int(x.strip())
     for x in os.getenv("ADMIN_IDS", "").split(",")
@@ -105,7 +110,8 @@ admin_input_state = {}
 # ============================================================
 
 async def init_db():
-    global mongo, db
+    global mongo
+    global db
     global chats_col
     global admins_col
     global dclean_state_col
@@ -113,7 +119,14 @@ async def init_db():
     global pending_col
     global purge_settings_col
 
-    mongo = AsyncIOMotorClient(MONGO_URI)
+    mongo = AsyncIOMotorClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=10000,
+    )
+
+    # Force connection test
+    await mongo.admin.command("ping")
+
     db = mongo[DB_NAME]
 
     chats_col = db["chats"]
@@ -123,37 +136,53 @@ async def init_db():
     pending_col = db["dclean_pending"]
     purge_settings_col = db["purge_settings"]
 
+    # ========================================================
+    # IMPORTANT:
+    #
+    # DO NOT DELETE OLD DATA.
+    #
+    # Old dclean_state may contain:
+    #   chat_id: null
+    #   missing chat_id
+    #
+    # Therefore we DO NOT create a unique index here.
+    # This preserves all old records safely.
+    # ========================================================
+
     await chats_col.create_index(
-        [("chat_id", ASCENDING)],
-        unique=True,
+        [("chat_id", ASCENDING)]
     )
 
     await admins_col.create_index(
-        [("user_id", ASCENDING)],
-        unique=True,
+        [("user_id", ASCENDING)]
     )
 
     await dclean_state_col.create_index(
-        [("chat_id", ASCENDING)],
-        unique=True,
+        [("chat_id", ASCENDING)]
     )
 
     await media_col.create_index(
-        [("chat_id", ASCENDING), ("fingerprint", ASCENDING)],
-        unique=True,
+        [
+            ("chat_id", ASCENDING),
+            ("fingerprint", ASCENDING),
+        ]
     )
 
     await pending_col.create_index(
-        [("chat_id", ASCENDING), ("message_id", ASCENDING)],
-        unique=True,
+        [
+            ("chat_id", ASCENDING),
+            ("message_id", ASCENDING),
+        ]
     )
 
     await purge_settings_col.create_index(
-        [("chat_id", ASCENDING)],
-        unique=True,
+        [("chat_id", ASCENDING)]
     )
 
-    # ENV admins
+    # ========================================================
+    # SEED ENV ADMINS
+    # ========================================================
+
     for admin_id in ADMIN_IDS:
         await admins_col.update_one(
             {"user_id": admin_id},
@@ -161,13 +190,17 @@ async def init_db():
                 "$set": {
                     "user_id": admin_id,
                     "source": "ENV",
-                    "updated_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.now(
+                        timezone.utc
+                    ),
                 }
             },
             upsert=True,
         )
 
-    logger.info("MongoDB initialized")
+    logger.info(
+        "MongoDB initialized safely"
+    )
 
 
 # ============================================================
@@ -175,26 +208,40 @@ async def init_db():
 # ============================================================
 
 async def is_admin(user_id: int) -> bool:
+
     if user_id in ADMIN_IDS:
         return True
 
-    doc = await admins_col.find_one({"user_id": user_id})
+    doc = await admins_col.find_one(
+        {"user_id": user_id}
+    )
+
     return bool(doc)
 
 
 async def get_admin_list():
-    cursor = admins_col.find({}).sort("user_id", ASCENDING)
-    return await cursor.to_list(length=500)
+
+    cursor = admins_col.find({}).sort(
+        "user_id",
+        ASCENDING,
+    )
+
+    return await cursor.to_list(
+        length=500
+    )
 
 
 async def add_admin(user_id: int):
+
     await admins_col.update_one(
         {"user_id": user_id},
         {
             "$set": {
                 "user_id": user_id,
                 "source": "MONGO",
-                "updated_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(
+                    timezone.utc
+                ),
             }
         },
         upsert=True,
@@ -202,7 +249,8 @@ async def add_admin(user_id: int):
 
 
 async def remove_admin(user_id: int):
-    # ENV admins cannot be removed
+
+    # ENV admins are protected
     if user_id in ADMIN_IDS:
         return False
 
@@ -222,7 +270,10 @@ async def register_chat(
     title: str,
     chat_type: str,
 ):
-    now = datetime.now(timezone.utc)
+
+    now = datetime.now(
+        timezone.utc
+    )
 
     await chats_col.update_one(
         {"chat_id": chat_id},
@@ -241,8 +292,12 @@ async def register_chat(
         upsert=True,
     )
 
-    # Create default purge setting ONLY for groups
-    if chat_type in ("group", "supergroup"):
+    # PURGE SETTINGS ONLY FOR GROUPS
+    if chat_type in (
+        "group",
+        "supergroup",
+    ):
+
         await purge_settings_col.update_one(
             {"chat_id": chat_id},
             {
@@ -258,66 +313,107 @@ async def register_chat(
         )
 
 
-async def deactivate_chat(chat_id: int):
+async def deactivate_chat(
+    chat_id: int,
+):
+
     await chats_col.update_one(
         {"chat_id": chat_id},
         {
             "$set": {
                 "active": False,
-                "updated_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(
+                    timezone.utc
+                ),
             }
         },
     )
 
 
-async def get_chat(chat_id: int):
-    return await chats_col.find_one({"chat_id": chat_id})
+async def get_chat(
+    chat_id: int,
+):
+
+    return await chats_col.find_one(
+        {"chat_id": chat_id}
+    )
 
 
 async def get_all_chats():
+
     cursor = chats_col.find(
         {"active": True}
-    ).sort("title", ASCENDING)
+    ).sort(
+        "title",
+        ASCENDING,
+    )
 
-    return await cursor.to_list(length=500)
+    return await cursor.to_list(
+        length=1000
+    )
 
 
 # ============================================================
 # TELETHON SAFE CALL
 # ============================================================
 
-async def telethon_call(func, *args, **kwargs):
+async def telethon_call(
+    func,
+    *args,
+    **kwargs,
+):
+
     while True:
+
         try:
-            return await func(*args, **kwargs)
+            return await func(
+                *args,
+                **kwargs,
+            )
 
         except FloodWaitError as e:
+
             logger.warning(
-                "FloodWait: sleeping %s seconds",
+                "Telegram FloodWait: %s seconds",
                 e.seconds,
             )
-            await asyncio.sleep(e.seconds + 2)
+
+            await asyncio.sleep(
+                e.seconds + 2
+            )
 
         except RPCError:
             raise
 
 
 # ============================================================
-# TELEGRAM LOG
+# LOG
 # ============================================================
 
-async def send_log(application, text: str):
+async def send_log(
+    application,
+    text: str,
+):
+
     if not PIPE_LOG_CHAT_ID:
         return
 
     try:
+
         await application.bot.send_message(
-            chat_id=int(PIPE_LOG_CHAT_ID),
+            chat_id=int(
+                PIPE_LOG_CHAT_ID
+            ),
             text=text,
             disable_web_page_preview=True,
         )
+
     except Exception as e:
-        logger.warning("Log send failed: %s", e)
+
+        logger.warning(
+            "PIPE log failed: %s",
+            e,
+        )
 
 
 # ============================================================
@@ -325,22 +421,39 @@ async def send_log(application, text: str):
 # ============================================================
 
 def get_media_fingerprint(message):
+
     """
-    Telethon messages do not expose Bot API file_unique_id.
+    Telethon does not provide Bot API file_unique_id.
 
-    We use Telegram media object IDs:
-      photo.id
-      document.id
+    We use Telegram media object IDs.
 
-    This detects repeated copies/forwards of the same Telegram
-    media object.
+    Same Telegram media object:
+        photo:<id>
+        document:<id>
+
+    This detects repeated copies/forwards of
+    the same Telegram media object.
     """
 
-    if getattr(message, "photo", None):
-        return f"photo:{message.photo.id}"
+    if getattr(
+        message,
+        "photo",
+        None,
+    ):
 
-    if getattr(message, "document", None):
-        return f"document:{message.document.id}"
+        return (
+            f"photo:{message.photo.id}"
+        )
+
+    if getattr(
+        message,
+        "document",
+        None,
+    ):
+
+        return (
+            f"document:{message.document.id}"
+        )
 
     return None
 
@@ -349,24 +462,58 @@ def get_media_fingerprint(message):
 # DCLEAN STATE
 # ============================================================
 
-async def get_last_dclean_id(chat_id: int) -> int:
+async def get_last_dclean_id(
+    chat_id: int,
+) -> int:
+
     doc = await dclean_state_col.find_one(
-        {"chat_id": chat_id}
+        {
+            "chat_id": chat_id
+        },
+        sort=[
+            (
+                "updated_at",
+                -1,
+            )
+        ],
     )
 
     if not doc:
         return 0
 
-    return int(doc.get("last_message_id", 0))
+    try:
+        return int(
+            doc.get(
+                "last_message_id",
+                0,
+            )
+        )
+    except Exception:
+        return 0
 
 
-async def save_last_dclean_id(chat_id: int, message_id: int):
+async def save_last_dclean_id(
+    chat_id: int,
+    message_id: int,
+):
+
+    # IMPORTANT:
+    #
+    # No unique index is required.
+    # This update preserves old records and
+    # updates the state belonging to this chat.
+
     await dclean_state_col.update_one(
-        {"chat_id": chat_id},
+        {
+            "chat_id": chat_id
+        },
         {
             "$set": {
+                "chat_id": chat_id,
                 "last_message_id": message_id,
-                "updated_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(
+                    timezone.utc
+                ),
             }
         },
         upsert=True,
@@ -381,25 +528,40 @@ async def run_dclean(
     chat_id: int,
     status_message=None,
 ):
+
     scanned = 0
     duplicates = 0
     deleted = 0
 
-    last_id = await get_last_dclean_id(chat_id)
+    last_id = await get_last_dclean_id(
+        chat_id
+    )
 
-    # --------------------------------------------------------
-    # Pending deletes from previous failed run
-    # --------------------------------------------------------
+    # ========================================================
+    # RETRY PENDING DELETE QUEUE
+    # ========================================================
 
     pending = await pending_col.find(
-        {"chat_id": chat_id}
-    ).to_list(length=5000)
+        {
+            "chat_id": chat_id
+        }
+    ).to_list(
+        length=5000
+    )
 
     if pending:
+
         for item in pending:
-            msg_id = item["message_id"]
+
+            msg_id = item.get(
+                "message_id"
+            )
+
+            if not msg_id:
+                continue
 
             try:
+
                 await telethon_call(
                     telethon_client.delete_messages,
                     chat_id,
@@ -408,65 +570,88 @@ async def run_dclean(
 
                 await pending_col.delete_one(
                     {
-                        "chat_id": chat_id,
-                        "message_id": msg_id,
+                        "_id": item["_id"]
                     }
                 )
 
                 deleted += 1
 
             except Exception as e:
+
                 logger.warning(
                     "Pending delete failed %s: %s",
                     msg_id,
                     e,
                 )
 
-    # --------------------------------------------------------
-    # Incremental scan
-    #
-    # First run:
-    #   last_id = 0
-    #   scans entire history
-    #
-    # Later:
-    #   only messages after last_id
-    # --------------------------------------------------------
-
-    highest_id = last_id
+    # ========================================================
+    # GET ENTITY
+    # ========================================================
 
     entity = await telethon_call(
         telethon_client.get_entity,
         chat_id,
     )
 
+    highest_id = last_id
+
+    # ========================================================
+    # INCREMENTAL SCAN
+    #
+    # First run:
+    #   last_id = 0
+    #   entire history
+    #
+    # Later:
+    #   only newer messages
+    # ========================================================
+
     async for message in telethon_client.iter_messages(
         entity,
         min_id=last_id,
         reverse=True,
     ):
+
         scanned += 1
 
         if message.id > highest_id:
             highest_id = message.id
 
-        fingerprint = get_media_fingerprint(message)
+        fingerprint = get_media_fingerprint(
+            message
+        )
 
         if fingerprint:
+
             existing = await media_col.find_one(
                 {
                     "chat_id": chat_id,
                     "fingerprint": fingerprint,
-                }
+                },
+                sort=[
+                    (
+                        "message_id",
+                        ASCENDING,
+                    )
+                ],
             )
 
-            if existing:
-                old_message_id = existing["message_id"]
+            # ------------------------------------------------
+            # DUPLICATE
+            # ------------------------------------------------
 
-                if old_message_id != message.id:
+            if existing:
+
+                original_id = existing.get(
+                    "message_id"
+                )
+
+                if original_id != message.id:
+
                     duplicates += 1
 
                     try:
+
                         await telethon_call(
                             telethon_client.delete_messages,
                             chat_id,
@@ -476,6 +661,14 @@ async def run_dclean(
                         deleted += 1
 
                     except Exception as e:
+
+                        logger.warning(
+                            "DCLEAN delete failed "
+                            "%s: %s",
+                            message.id,
+                            e,
+                        )
+
                         await pending_col.update_one(
                             {
                                 "chat_id": chat_id,
@@ -485,6 +678,7 @@ async def run_dclean(
                                 "$set": {
                                     "chat_id": chat_id,
                                     "message_id": message.id,
+                                    "fingerprint": fingerprint,
                                     "error": str(e),
                                     "updated_at": datetime.now(
                                         timezone.utc
@@ -494,8 +688,21 @@ async def run_dclean(
                             upsert=True,
                         )
 
+            # ------------------------------------------------
+            # FIRST SEEN MEDIA
+            # ------------------------------------------------
+
             else:
+
+                # DO NOT use unique index.
+                #
+                # Existing databases may already contain
+                # duplicate fingerprint records.
+                #
+                # This insert is protected against race errors.
+
                 try:
+
                     await media_col.insert_one(
                         {
                             "chat_id": chat_id,
@@ -506,32 +713,63 @@ async def run_dclean(
                             ),
                         }
                     )
-                except Exception:
-                    pass
 
-        if scanned % 100 == 0 and status_message:
-            remaining = max(0, duplicates - deleted)
+                except Exception as e:
+
+                    logger.debug(
+                        "Fingerprint insert skipped: %s",
+                        e,
+                    )
+
+        # ====================================================
+        # LIVE PROGRESS
+        # ====================================================
+
+        if (
+            scanned % 100 == 0
+            and status_message
+        ):
+
+            remaining = max(
+                0,
+                duplicates - deleted,
+            )
 
             try:
+
                 await status_message.edit_text(
                     "♻️ <b>DCLEAN RUNNING</b>\n\n"
-                    f"📥 Scanned: <code>{scanned}</code>\n"
-                    f"♻️ Duplicates: <code>{duplicates}</code>\n"
-                    f"🗑️ Deleted: <code>{deleted}</code>\n"
-                    f"📌 Remaining: <code>{remaining}</code>\n"
-                    f"🔢 Last ID: <code>{highest_id}</code>",
+                    f"📥 Scanned: "
+                    f"<code>{scanned}</code>\n"
+                    f"♻️ Duplicates: "
+                    f"<code>{duplicates}</code>\n"
+                    f"🗑️ Deleted: "
+                    f"<code>{deleted}</code>\n"
+                    f"📌 Remaining: "
+                    f"<code>{remaining}</code>\n"
+                    f"🔢 Last ID: "
+                    f"<code>{highest_id}</code>",
                     parse_mode="HTML",
                 )
+
             except Exception:
                 pass
 
+    # ========================================================
+    # SAVE STATE
+    # ========================================================
+
     if highest_id > last_id:
+
         await save_last_dclean_id(
             chat_id,
             highest_id,
         )
 
-    remaining = max(0, duplicates - deleted)
+    remaining = max(
+        0,
+        duplicates - deleted,
+    )
 
     return {
         "scanned": scanned,
@@ -546,12 +784,18 @@ async def run_dclean(
 # PURGE SETTINGS
 # ============================================================
 
-async def get_purge_settings(chat_id: int):
+async def get_purge_settings(
+    chat_id: int,
+):
+
     doc = await purge_settings_col.find_one(
-        {"chat_id": chat_id}
+        {
+            "chat_id": chat_id
+        }
     )
 
     if not doc:
+
         doc = {
             "chat_id": chat_id,
             "enabled": False,
@@ -559,7 +803,15 @@ async def get_purge_settings(chat_id: int):
             "delete_duplicates": False,
         }
 
-        await purge_settings_col.insert_one(doc)
+        await purge_settings_col.update_one(
+            {
+                "chat_id": chat_id
+            },
+            {
+                "$set": doc
+            },
+            upsert=True,
+        )
 
     return doc
 
@@ -568,11 +820,18 @@ async def save_purge_settings(
     chat_id: int,
     **values,
 ):
-    values["updated_at"] = datetime.now(timezone.utc)
+
+    values["updated_at"] = datetime.now(
+        timezone.utc
+    )
 
     await purge_settings_col.update_one(
-        {"chat_id": chat_id},
-        {"$set": values},
+        {
+            "chat_id": chat_id
+        },
+        {
+            "$set": values
+        },
         upsert=True,
     )
 
@@ -585,14 +844,17 @@ async def run_purge(
     chat_id: int,
     status_message=None,
 ):
-    chat = await get_chat(chat_id)
+
+    chat = await get_chat(
+        chat_id
+    )
 
     if not chat:
         return None
 
-    # --------------------------------------------------------
-    # PURGE IS GROUP / SUPERGROUP ONLY
-    # --------------------------------------------------------
+    # ========================================================
+    # HARD CHANNEL PROTECTION
+    # ========================================================
 
     if chat["type"] not in (
         "group",
@@ -600,19 +862,32 @@ async def run_purge(
     ):
         return None
 
-    settings = await get_purge_settings(chat_id)
+    settings = await get_purge_settings(
+        chat_id
+    )
 
     minutes = int(
-        settings.get("minutes", 60)
+        settings.get(
+            "minutes",
+            60,
+        )
     )
 
     delete_duplicates = bool(
-        settings.get("delete_duplicates", False)
+        settings.get(
+            "delete_duplicates",
+            False,
+        )
     )
 
-    cutoff = datetime.now(
-        timezone.utc
-    ) - timedelta(minutes=minutes)
+    cutoff = (
+        datetime.now(
+            timezone.utc
+        )
+        - timedelta(
+            minutes=minutes
+        )
+    )
 
     deleted = 0
     checked = 0
@@ -633,84 +908,107 @@ async def run_purge(
             chat_id,
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # NORMAL PURGE
-        # ----------------------------------------------------
+        # ====================================================
 
         old_ids = []
 
         async for message in telethon_client.iter_messages(
             entity
         ):
+
             checked += 1
 
             msg_date = message.date
 
             if msg_date.tzinfo is None:
+
                 msg_date = msg_date.replace(
                     tzinfo=timezone.utc
                 )
 
             if msg_date < cutoff:
-                old_ids.append(message.id)
+
+                old_ids.append(
+                    message.id
+                )
+
                 old_found += 1
 
-            else:
-                # newest -> oldest
-                # once we reach newer-than-cutoff boundary,
-                # continue because Telegram history is ordered.
-                continue
+            # ------------------------------------------------
+            # Delete in batches
+            # ------------------------------------------------
 
             if len(old_ids) >= 100:
 
                 try:
+
                     await telethon_call(
                         telethon_client.delete_messages,
                         chat_id,
                         old_ids,
                     )
 
-                    deleted += len(old_ids)
+                    deleted += len(
+                        old_ids
+                    )
 
                 except Exception as e:
+
                     logger.warning(
-                        "Purge delete error: %s",
+                        "Purge delete failed: %s",
                         e,
                     )
 
                 old_ids.clear()
 
                 if status_message:
+
                     try:
+
                         await status_message.edit_text(
                             "🗑️ <b>PURGE RUNNING</b>\n\n"
-                            f"🔎 Checked: <code>{checked}</code>\n"
-                            f"📦 Old found: <code>{old_found}</code>\n"
-                            f"🗑️ Deleted: <code>{deleted}</code>",
+                            f"🔎 Checked: "
+                            f"<code>{checked}</code>\n"
+                            f"📦 Old found: "
+                            f"<code>{old_found}</code>\n"
+                            f"🗑️ Deleted: "
+                            f"<code>{deleted}</code>",
                             parse_mode="HTML",
                         )
+
                     except Exception:
                         pass
 
+        # ====================================================
+        # FINAL BATCH
+        # ====================================================
+
         if old_ids:
+
             try:
+
                 await telethon_call(
                     telethon_client.delete_messages,
                     chat_id,
                     old_ids,
                 )
 
-                deleted += len(old_ids)
+                deleted += len(
+                    old_ids
+                )
 
             except Exception as e:
+
                 logger.warning(
-                    "Final purge delete error: %s",
+                    "Final purge failed: %s",
                     e,
                 )
 
-        # ----------------------------------------------------
-        # OPTIONAL DUPLICATE DELETE
-        # ----------------------------------------------------
+        # ====================================================
+        # OPTIONAL DUPLICATE PURGE
+        # ====================================================
 
         duplicate_deleted = 0
 
@@ -721,6 +1019,7 @@ async def run_purge(
             async for message in telethon_client.iter_messages(
                 entity
             ):
+
                 fingerprint = get_media_fingerprint(
                     message
                 )
@@ -733,6 +1032,7 @@ async def run_purge(
                     msg_date = message.date
 
                     if msg_date.tzinfo is None:
+
                         msg_date = msg_date.replace(
                             tzinfo=timezone.utc
                         )
@@ -740,6 +1040,7 @@ async def run_purge(
                     if msg_date < cutoff:
 
                         try:
+
                             await telethon_call(
                                 telethon_client.delete_messages,
                                 chat_id,
@@ -753,7 +1054,10 @@ async def run_purge(
                             pass
 
                 else:
-                    seen.add(fingerprint)
+
+                    seen.add(
+                        fingerprint
+                    )
 
     return {
         "checked": checked,
@@ -772,57 +1076,81 @@ async def purge_worker(
     application,
     chat_id: int,
 ):
+
     logger.info(
-        "Purge worker started: %s",
+        "PURGE worker started: %s",
         chat_id,
     )
 
     while True:
+
         try:
 
             settings = await get_purge_settings(
                 chat_id
             )
 
-            chat = await get_chat(chat_id)
+            chat = await get_chat(
+                chat_id
+            )
 
-            # Channel protection
-            if not chat or chat["type"] not in (
-                "group",
-                "supergroup",
+            # =================================================
+            # CHANNEL PROTECTION
+            # =================================================
+
+            if (
+                not chat
+                or chat["type"]
+                not in (
+                    "group",
+                    "supergroup",
+                )
             ):
                 break
 
-            if not settings.get("enabled", False):
+            if not settings.get(
+                "enabled",
+                False,
+            ):
                 break
 
-            result = await run_purge(chat_id)
+            result = await run_purge(
+                chat_id
+            )
 
             if result:
+
                 logger.info(
-                    "PURGE %s: deleted=%s",
+                    "PURGE %s deleted=%s",
                     chat_id,
                     result["deleted"],
                 )
 
-            await asyncio.sleep(60)
+            await asyncio.sleep(
+                60
+            )
 
         except asyncio.CancelledError:
             break
 
         except Exception as e:
+
             logger.exception(
-                "Purge worker error %s: %s",
+                "PURGE worker error %s",
                 chat_id,
-                e,
             )
 
-            await asyncio.sleep(60)
+            await asyncio.sleep(
+                60
+            )
 
-    purge_tasks.pop(chat_id, None)
+    purge_tasks.pop(
+        chat_id,
+        None,
+    )
 
     logger.info(
-        "Purge worker stopped: %s",
+        "PURGE worker stopped: %s",
         chat_id,
     )
 
@@ -831,9 +1159,15 @@ def start_purge_worker(
     application,
     chat_id: int,
 ):
-    existing = purge_tasks.get(chat_id)
 
-    if existing and not existing.done():
+    existing = purge_tasks.get(
+        chat_id
+    )
+
+    if (
+        existing
+        and not existing.done()
+    ):
         return
 
     task = asyncio.create_task(
@@ -843,39 +1177,64 @@ def start_purge_worker(
         )
     )
 
-    purge_tasks[chat_id] = task
+    purge_tasks[
+        chat_id
+    ] = task
 
 
-def stop_purge_worker(chat_id: int):
-    task = purge_tasks.get(chat_id)
+def stop_purge_worker(
+    chat_id: int,
+):
 
-    if task and not task.done():
+    task = purge_tasks.get(
+        chat_id
+    )
+
+    if (
+        task
+        and not task.done()
+    ):
         task.cancel()
 
-    purge_tasks.pop(chat_id, None)
+    purge_tasks.pop(
+        chat_id,
+        None,
+    )
 
 
 async def restore_purge_workers(
     application,
 ):
+
     cursor = purge_settings_col.find(
         {
-            "enabled": True,
+            "enabled": True
         }
     )
 
     async for settings in cursor:
 
-        chat_id = settings["chat_id"]
+        chat_id = settings.get(
+            "chat_id"
+        )
 
-        chat = await get_chat(chat_id)
+        if not chat_id:
+            continue
 
-        # IMPORTANT:
-        # only GROUP / SUPERGROUP
-        if chat and chat["type"] in (
-            "group",
-            "supergroup",
+        chat = await get_chat(
+            chat_id
+        )
+
+        # ONLY GROUP/SUPERGROUP
+        if (
+            chat
+            and chat["type"]
+            in (
+                "group",
+                "supergroup",
+            )
         ):
+
             start_purge_worker(
                 application,
                 chat_id,
@@ -883,10 +1242,11 @@ async def restore_purge_workers(
 
 
 # ============================================================
-# MAIN MENU
+# MAIN KEYBOARD
 # ============================================================
 
 def main_keyboard():
+
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
@@ -903,19 +1263,28 @@ def main_keyboard():
     ])
 
 
+# ============================================================
+# START
+# ============================================================
+
 async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not update.effective_user:
         return
 
     user_id = update.effective_user.id
 
-    if not await is_admin(user_id):
+    if not await is_admin(
+        user_id
+    ):
+
         await update.message.reply_text(
             "⛔ Access Denied."
         )
+
         return
 
     await update.message.reply_text(
@@ -933,24 +1302,30 @@ async def start_command(
 async def show_chat_list(
     query,
 ):
+
     chats = await get_all_chats()
 
     buttons = []
 
     for chat in chats:
 
-        chat_type = chat["type"]
+        chat_type = chat.get(
+            "type",
+            ""
+        )
 
         if chat_type == "channel":
             icon = "📢"
+
         elif chat_type == "supergroup":
             icon = "👥"
+
         else:
             icon = "👤"
 
         title = chat.get(
             "title",
-            str(chat["chat_id"]),
+            str(chat.get("chat_id")),
         )
 
         buttons.append([
@@ -973,12 +1348,15 @@ async def show_chat_list(
         ),
     ])
 
-    if not buttons:
+    if not chats:
+
         text = (
             "👥 <b>No chats registered.</b>\n\n"
             "Add the bot to a group/channel first."
         )
+
     else:
+
         text = (
             "👥 <b>SELECT CHAT</b>\n\n"
             "📢 Channel → DCLEAN only\n"
@@ -1002,13 +1380,18 @@ async def show_chat_panel(
     query,
     chat_id: int,
 ):
-    chat = await get_chat(chat_id)
+
+    chat = await get_chat(
+        chat_id
+    )
 
     if not chat:
+
         await query.answer(
             "Chat not found",
             show_alert=True,
         )
+
         return
 
     title = chat.get(
@@ -1016,29 +1399,41 @@ async def show_chat_panel(
         str(chat_id),
     )
 
-    chat_type = chat["type"]
+    chat_type = chat.get(
+        "type",
+        "",
+    )
+
+    # ========================================================
+    # DCLEAN ALWAYS
+    # ========================================================
 
     buttons = [
         [
             InlineKeyboardButton(
                 "♻️ DCLEAN",
-                callback_data=f"dclean:{chat_id}",
+                callback_data=(
+                    f"dclean:{chat_id}"
+                ),
             )
         ]
     ]
 
-    # --------------------------------------------------------
-    # PURGE ONLY GROUP / SUPERGROUP
-    # --------------------------------------------------------
+    # ========================================================
+    # PURGE ONLY GROUP/SUPERGROUP
+    # ========================================================
 
     if chat_type in (
         "group",
         "supergroup",
     ):
+
         buttons.append([
             InlineKeyboardButton(
                 "🗑️ PURGE",
-                callback_data=f"purge:{chat_id}",
+                callback_data=(
+                    f"purge:{chat_id}"
+                ),
             )
         ])
 
@@ -1046,7 +1441,9 @@ async def show_chat_panel(
         [
             InlineKeyboardButton(
                 "📊 STATUS",
-                callback_data=f"status:{chat_id}",
+                callback_data=(
+                    f"status:{chat_id}"
+                ),
             )
         ],
         [
@@ -1057,13 +1454,17 @@ async def show_chat_panel(
         ],
     ])
 
-    type_name = (
-        "📢 Channel"
-        if chat_type == "channel"
-        else "👥 Group"
-        if chat_type == "group"
-        else "👥 Supergroup"
-    )
+    if chat_type == "channel":
+
+        type_name = "📢 Channel"
+
+    elif chat_type == "supergroup":
+
+        type_name = "👥 Supergroup"
+
+    else:
+
+        type_name = "👤 Group"
 
     await query.edit_message_text(
         f"<b>{escape(title)}</b>\n\n"
@@ -1083,17 +1484,26 @@ async def show_purge_menu(
     query,
     chat_id: int,
 ):
-    chat = await get_chat(chat_id)
+
+    chat = await get_chat(
+        chat_id
+    )
 
     # HARD PROTECTION
-    if not chat or chat["type"] not in (
-        "group",
-        "supergroup",
+    if (
+        not chat
+        or chat["type"]
+        not in (
+            "group",
+            "supergroup",
+        )
     ):
+
         await query.answer(
             "PURGE is available for groups only.",
             show_alert=True,
         )
+
         return
 
     settings = await get_purge_settings(
@@ -1101,11 +1511,17 @@ async def show_purge_menu(
     )
 
     minutes = int(
-        settings.get("minutes", 60)
+        settings.get(
+            "minutes",
+            60,
+        )
     )
 
     enabled = bool(
-        settings.get("enabled", False)
+        settings.get(
+            "enabled",
+            False,
+        )
     )
 
     duplicate = bool(
@@ -1120,6 +1536,7 @@ async def show_purge_menu(
     preset_row = []
 
     for value, label in PURGE_PRESETS.items():
+
         preset_row.append(
             InlineKeyboardButton(
                 label,
@@ -1130,11 +1547,18 @@ async def show_purge_menu(
         )
 
         if len(preset_row) == 3:
-            buttons.append(preset_row)
+
+            buttons.append(
+                preset_row
+            )
+
             preset_row = []
 
     if preset_row:
-        buttons.append(preset_row)
+
+        buttons.append(
+            preset_row
+        )
 
     buttons.append([
         InlineKeyboardButton(
@@ -1150,7 +1574,8 @@ async def show_purge_menu(
             (
                 "♻️ Duplicate Delete: ON"
                 if duplicate
-                else "♻️ Duplicate Delete: OFF"
+                else
+                "♻️ Duplicate Delete: OFF"
             ),
             callback_data=(
                 f"pduplicate:{chat_id}"
@@ -1163,7 +1588,8 @@ async def show_purge_menu(
             (
                 "🟢 PURGE ENABLED"
                 if enabled
-                else "🔴 PURGE DISABLED"
+                else
+                "🔴 PURGE DISABLED"
             ),
             callback_data=(
                 f"ptoggle:{chat_id}"
@@ -1183,13 +1609,16 @@ async def show_purge_menu(
     buttons.append([
         InlineKeyboardButton(
             "🔙 Back",
-            callback_data=f"chat:{chat_id}",
+            callback_data=(
+                f"chat:{chat_id}"
+            ),
         )
     ])
 
     await query.edit_message_text(
         "🗑️ <b>PURGE SETTINGS</b>\n\n"
-        f"⏱️ Current: <code>{minutes}</code> minutes\n"
+        f"⏱️ Current: "
+        f"<code>{minutes}</code> minutes\n"
         f"📌 Status: "
         f"<code>{'ON' if enabled else 'OFF'}</code>\n"
         f"♻️ Duplicate Delete: "
@@ -1205,7 +1634,10 @@ async def show_purge_menu(
 # ADMIN MENU
 # ============================================================
 
-async def show_admin_menu(query):
+async def show_admin_menu(
+    query,
+):
+
     admins = await get_admin_list()
 
     lines = [
@@ -1216,11 +1648,17 @@ async def show_admin_menu(query):
     ]
 
     for admin in admins:
-        uid = admin["user_id"]
+
+        uid = admin.get(
+            "user_id"
+        )
 
         if uid in ADMIN_IDS:
+
             source = "ENV"
+
         else:
+
             source = "MongoDB"
 
         lines.append(
@@ -1271,13 +1709,18 @@ async def show_status(
     query,
     chat_id: int,
 ):
-    chat = await get_chat(chat_id)
+
+    chat = await get_chat(
+        chat_id
+    )
 
     if not chat:
+
         await query.answer(
             "Chat not found",
             show_alert=True,
         )
+
         return
 
     last_id = await get_last_dclean_id(
@@ -1285,15 +1728,19 @@ async def show_status(
     )
 
     media_count = await media_col.count_documents(
-        {"chat_id": chat_id}
+        {
+            "chat_id": chat_id
+        }
     )
 
     pending_count = await pending_col.count_documents(
-        {"chat_id": chat_id}
+        {
+            "chat_id": chat_id
+        }
     )
 
     text = (
-        f"📊 <b>STATUS</b>\n\n"
+        "📊 <b>STATUS</b>\n\n"
         f"👥 {escape(chat.get('title', str(chat_id)))}\n\n"
         f"🔢 Last DCLEAN ID: "
         f"<code>{last_id}</code>\n"
@@ -1307,18 +1754,24 @@ async def show_status(
         "group",
         "supergroup",
     ):
+
         settings = await get_purge_settings(
             chat_id
         )
 
         text += (
             "\n\n🗑️ <b>PURGE</b>\n"
-            f"⏱️ "
-            f"<code>{settings.get('minutes', 60)}</code> min\n"
+            f"⏱️ <code>"
+            f"{settings.get('minutes', 60)}"
+            f"</code> min\n"
             f"📌 Enabled: "
-            f"<code>{'YES' if settings.get('enabled') else 'NO'}</code>"
+            f"<code>"
+            f"{'YES' if settings.get('enabled') else 'NO'}"
+            f"</code>"
         )
+
     else:
+
         text += (
             "\n\n📢 <b>CHANNEL</b>\n"
             "🗑️ PURGE: <b>NOT AVAILABLE</b>"
@@ -1331,7 +1784,9 @@ async def show_status(
             [
                 InlineKeyboardButton(
                     "🔙 Back",
-                    callback_data=f"chat:{chat_id}",
+                    callback_data=(
+                        f"chat:{chat_id}"
+                    ),
                 )
             ]
         ]),
@@ -1346,76 +1801,99 @@ async def callback_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     query = update.callback_query
 
     if not query:
         return
 
-    await query.answer()
-
     user_id = query.from_user.id
 
-    if not await is_admin(user_id):
+    if not await is_admin(
+        user_id
+    ):
+
         await query.answer(
             "⛔ Access Denied",
             show_alert=True,
         )
+
         return
+
+    await query.answer()
 
     data = query.data or ""
 
-    # --------------------------------------------------------
-    # MAIN
-    # --------------------------------------------------------
+    # ========================================================
+    # MAIN MENU
+    # ========================================================
 
     if data == "main_menu":
+
         await query.edit_message_text(
             "♻️ <b>Duplicate Cleaner</b>\n\n"
             "Select an option:",
             parse_mode="HTML",
             reply_markup=main_keyboard(),
         )
+
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # CHAT LIST
-    # --------------------------------------------------------
+    # ========================================================
 
     if data == "chat_list":
-        await show_chat_list(query)
+
+        await show_chat_list(
+            query
+        )
+
         return
 
-    # --------------------------------------------------------
-    # CHAT PANEL
-    # --------------------------------------------------------
+    # ========================================================
+    # CHAT
+    # ========================================================
 
     if data.startswith("chat:"):
+
         chat_id = int(
-            data.split(":", 1)[1]
+            data.split(
+                ":",
+                1,
+            )[1]
         )
 
         await show_chat_panel(
             query,
             chat_id,
         )
+
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # DCLEAN
-    # --------------------------------------------------------
+    # ========================================================
 
     if data.startswith("dclean:"):
 
         chat_id = int(
-            data.split(":", 1)[1]
+            data.split(
+                ":",
+                1,
+            )[1]
         )
 
-        chat = await get_chat(chat_id)
+        chat = await get_chat(
+            chat_id
+        )
 
         if not chat:
+
             await query.edit_message_text(
                 "❌ Chat not found."
             )
+
             return
 
         await query.edit_message_text(
@@ -1425,6 +1903,7 @@ async def callback_handler(
         )
 
         try:
+
             result = await run_dclean(
                 chat_id,
                 query.message,
@@ -1447,13 +1926,16 @@ async def callback_handler(
                     [
                         InlineKeyboardButton(
                             "🔙 Back",
-                            callback_data=f"chat:{chat_id}",
+                            callback_data=(
+                                f"chat:{chat_id}"
+                            ),
                         )
                     ]
                 ]),
             )
 
         except Exception as e:
+
             logger.exception(
                 "DCLEAN error"
             )
@@ -1466,7 +1948,9 @@ async def callback_handler(
                     [
                         InlineKeyboardButton(
                             "🔙 Back",
-                            callback_data=f"chat:{chat_id}",
+                            callback_data=(
+                                f"chat:{chat_id}"
+                            ),
                         )
                     ]
                 ]),
@@ -1474,59 +1958,82 @@ async def callback_handler(
 
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # STATUS
-    # --------------------------------------------------------
+    # ========================================================
 
     if data.startswith("status:"):
 
         chat_id = int(
-            data.split(":", 1)[1]
+            data.split(
+                ":",
+                1,
+            )[1]
         )
 
         await show_status(
             query,
             chat_id,
         )
+
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # PURGE MENU
-    # --------------------------------------------------------
+    # ========================================================
 
     if data.startswith("purge:"):
 
         chat_id = int(
-            data.split(":", 1)[1]
+            data.split(
+                ":",
+                1,
+            )[1]
         )
 
         await show_purge_menu(
             query,
             chat_id,
         )
+
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # PURGE MINUTES
-    # --------------------------------------------------------
+    # ========================================================
 
     if data.startswith("pminutes:"):
 
-        _, chat_id, minutes = data.split(":")
+        _, chat_id, minutes = (
+            data.split(":")
+        )
 
-        chat_id = int(chat_id)
-        minutes = int(minutes)
+        chat_id = int(
+            chat_id
+        )
 
-        chat = await get_chat(chat_id)
+        minutes = int(
+            minutes
+        )
 
-        if not chat or chat["type"] not in (
-            "group",
-            "supergroup",
+        chat = await get_chat(
+            chat_id
+        )
+
+        if (
+            not chat
+            or chat["type"]
+            not in (
+                "group",
+                "supergroup",
+            )
         ):
+
             await query.answer(
                 "PURGE is only for groups.",
                 show_alert=True,
             )
+
             return
 
         await save_purge_settings(
@@ -1538,28 +2045,42 @@ async def callback_handler(
             query,
             chat_id,
         )
+
         return
 
-    # --------------------------------------------------------
-    # DUPLICATE DELETE
-    # --------------------------------------------------------
+    # ========================================================
+    # DUPLICATE DELETE TOGGLE
+    # ========================================================
 
-    if data.startswith("pduplicate:"):
+    if data.startswith(
+        "pduplicate:"
+    ):
 
         chat_id = int(
-            data.split(":", 1)[1]
+            data.split(
+                ":",
+                1,
+            )[1]
         )
 
-        chat = await get_chat(chat_id)
+        chat = await get_chat(
+            chat_id
+        )
 
-        if not chat or chat["type"] not in (
-            "group",
-            "supergroup",
+        if (
+            not chat
+            or chat["type"]
+            not in (
+                "group",
+                "supergroup",
+            )
         ):
+
             await query.answer(
                 "PURGE is only for groups.",
                 show_alert=True,
             )
+
             return
 
         settings = await get_purge_settings(
@@ -1582,28 +2103,42 @@ async def callback_handler(
             query,
             chat_id,
         )
+
         return
 
-    # --------------------------------------------------------
-    # PURGE TOGGLE
-    # --------------------------------------------------------
+    # ========================================================
+    # PURGE ENABLE/DISABLE
+    # ========================================================
 
-    if data.startswith("ptoggle:"):
+    if data.startswith(
+        "ptoggle:"
+    ):
 
         chat_id = int(
-            data.split(":", 1)[1]
+            data.split(
+                ":",
+                1,
+            )[1]
         )
 
-        chat = await get_chat(chat_id)
+        chat = await get_chat(
+            chat_id
+        )
 
-        if not chat or chat["type"] not in (
-            "group",
-            "supergroup",
+        if (
+            not chat
+            or chat["type"]
+            not in (
+                "group",
+                "supergroup",
+            )
         ):
+
             await query.answer(
                 "PURGE is only for groups.",
                 show_alert=True,
             )
+
             return
 
         settings = await get_purge_settings(
@@ -1611,7 +2146,10 @@ async def callback_handler(
         )
 
         current = bool(
-            settings.get("enabled", False)
+            settings.get(
+                "enabled",
+                False,
+            )
         )
 
         new_value = not current
@@ -1622,11 +2160,14 @@ async def callback_handler(
         )
 
         if new_value:
+
             start_purge_worker(
                 context.application,
                 chat_id,
             )
+
         else:
+
             stop_purge_worker(
                 chat_id
             )
@@ -1635,28 +2176,42 @@ async def callback_handler(
             query,
             chat_id,
         )
+
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # RUN PURGE NOW
-    # --------------------------------------------------------
+    # ========================================================
 
-    if data.startswith("prun:"):
+    if data.startswith(
+        "prun:"
+    ):
 
         chat_id = int(
-            data.split(":", 1)[1]
+            data.split(
+                ":",
+                1,
+            )[1]
         )
 
-        chat = await get_chat(chat_id)
+        chat = await get_chat(
+            chat_id
+        )
 
-        if not chat or chat["type"] not in (
-            "group",
-            "supergroup",
+        if (
+            not chat
+            or chat["type"]
+            not in (
+                "group",
+                "supergroup",
+            )
         ):
+
             await query.answer(
                 "PURGE is only for groups.",
                 show_alert=True,
             )
+
             return
 
         await query.edit_message_text(
@@ -1666,15 +2221,18 @@ async def callback_handler(
         )
 
         try:
+
             result = await run_purge(
                 chat_id,
                 query.message,
             )
 
             if result is None:
+
                 await query.edit_message_text(
-                    "⚠️ Purge is already running."
+                    "⚠️ PURGE is already running."
                 )
+
                 return
 
             await query.edit_message_text(
@@ -1694,13 +2252,16 @@ async def callback_handler(
                     [
                         InlineKeyboardButton(
                             "🔙 Back",
-                            callback_data=f"purge:{chat_id}",
+                            callback_data=(
+                                f"purge:{chat_id}"
+                            ),
                         )
                     ]
                 ]),
             )
 
         except Exception as e:
+
             logger.exception(
                 "PURGE error"
             )
@@ -1713,7 +2274,9 @@ async def callback_handler(
                     [
                         InlineKeyboardButton(
                             "🔙 Back",
-                            callback_data=f"purge:{chat_id}",
+                            callback_data=(
+                                f"purge:{chat_id}"
+                            ),
                         )
                     ]
                 ]),
@@ -1721,29 +2284,44 @@ async def callback_handler(
 
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # CUSTOM PURGE
-    # --------------------------------------------------------
+    # ========================================================
 
-    if data.startswith("custompurge:"):
+    if data.startswith(
+        "custompurge:"
+    ):
 
         chat_id = int(
-            data.split(":", 1)[1]
+            data.split(
+                ":",
+                1,
+            )[1]
         )
 
-        chat = await get_chat(chat_id)
+        chat = await get_chat(
+            chat_id
+        )
 
-        if not chat or chat["type"] not in (
-            "group",
-            "supergroup",
+        if (
+            not chat
+            or chat["type"]
+            not in (
+                "group",
+                "supergroup",
+            )
         ):
+
             await query.answer(
                 "PURGE is only for groups.",
                 show_alert=True,
             )
+
             return
 
-        admin_input_state[user_id] = {
+        admin_input_state[
+            user_id
+        ] = {
             "action": "custom_purge",
             "chat_id": chat_id,
         }
@@ -1755,48 +2333,59 @@ async def callback_handler(
             "<code>45</code>",
             parse_mode="HTML",
         )
+
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # ADMIN MENU
-    # --------------------------------------------------------
+    # ========================================================
 
     if data == "admin_menu":
-        await show_admin_menu(query)
+
+        await show_admin_menu(
+            query
+        )
+
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # ADD ADMIN
-    # --------------------------------------------------------
+    # ========================================================
 
     if data == "add_admin":
 
-        admin_input_state[user_id] = {
+        admin_input_state[
+            user_id
+        ] = {
             "action": "add_admin"
         }
 
         await query.edit_message_text(
             "➕ <b>ADD ADMIN</b>\n\n"
-            "Send the Telegram numeric user ID.",
+            "Send Telegram numeric user ID.",
             parse_mode="HTML",
         )
+
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # REMOVE ADMIN
-    # --------------------------------------------------------
+    # ========================================================
 
     if data == "remove_admin":
 
-        admin_input_state[user_id] = {
+        admin_input_state[
+            user_id
+        ] = {
             "action": "remove_admin"
         }
 
         await query.edit_message_text(
             "❌ <b>REMOVE ADMIN</b>\n\n"
-            "Send the Telegram numeric user ID.",
+            "Send Telegram numeric user ID.",
             parse_mode="HTML",
         )
+
         return
 
 
@@ -1808,12 +2397,15 @@ async def text_input_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not update.effective_user:
         return
 
     user_id = update.effective_user.id
 
-    if not await is_admin(user_id):
+    if not await is_admin(
+        user_id
+    ):
         return
 
     state = admin_input_state.get(
@@ -1827,20 +2419,28 @@ async def text_input_handler(
         update.message.text or ""
     ).strip()
 
-    action = state.get("action")
+    action = state.get(
+        "action"
+    )
 
-    # --------------------------------------------------------
+    # ========================================================
     # ADD ADMIN
-    # --------------------------------------------------------
+    # ========================================================
 
     if action == "add_admin":
 
         try:
-            target_id = int(text)
+
+            target_id = int(
+                text
+            )
+
         except ValueError:
+
             await update.message.reply_text(
                 "❌ Invalid user ID."
             )
+
             return
 
         await add_admin(
@@ -1853,7 +2453,7 @@ async def text_input_handler(
         )
 
         await update.message.reply_text(
-            f"✅ Admin added:\n"
+            "✅ Admin added:\n"
             f"<code>{target_id}</code>",
             parse_mode="HTML",
             reply_markup=main_keyboard(),
@@ -1861,24 +2461,32 @@ async def text_input_handler(
 
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # REMOVE ADMIN
-    # --------------------------------------------------------
+    # ========================================================
 
     if action == "remove_admin":
 
         try:
-            target_id = int(text)
+
+            target_id = int(
+                text
+            )
+
         except ValueError:
+
             await update.message.reply_text(
                 "❌ Invalid user ID."
             )
+
             return
 
         if target_id in ADMIN_IDS:
+
             await update.message.reply_text(
                 "⛔ ENV ADMIN cannot be removed."
             )
+
             return
 
         removed = await remove_admin(
@@ -1891,9 +2499,16 @@ async def text_input_handler(
         )
 
         if removed:
-            result = "✅ Admin removed."
+
+            result = (
+                "✅ Admin removed."
+            )
+
         else:
-            result = "⚠️ Admin not found."
+
+            result = (
+                "⚠️ Admin not found."
+            )
 
         await update.message.reply_text(
             result,
@@ -1902,42 +2517,55 @@ async def text_input_handler(
 
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # CUSTOM PURGE
-    # --------------------------------------------------------
+    # ========================================================
 
     if action == "custom_purge":
 
         try:
-            minutes = int(text)
+
+            minutes = int(
+                text
+            )
 
             if minutes < 1:
                 raise ValueError
 
         except ValueError:
+
             await update.message.reply_text(
-                "❌ Enter a valid number of minutes."
+                "❌ Enter valid minutes."
             )
+
             return
 
-        chat_id = state["chat_id"]
+        chat_id = state[
+            "chat_id"
+        ]
 
         chat = await get_chat(
             chat_id
         )
 
-        if not chat or chat["type"] not in (
-            "group",
-            "supergroup",
+        if (
+            not chat
+            or chat["type"]
+            not in (
+                "group",
+                "supergroup",
+            )
         ):
+
             admin_input_state.pop(
                 user_id,
                 None,
             )
 
             await update.message.reply_text(
-                "⛔ PURGE is only available for groups."
+                "⛔ PURGE is only for groups."
             )
+
             return
 
         await save_purge_settings(
@@ -1951,7 +2579,7 @@ async def text_input_handler(
         )
 
         await update.message.reply_text(
-            f"✅ PURGE time saved: "
+            "✅ PURGE time saved:\n"
             f"<code>{minutes}</code> minutes",
             parse_mode="HTML",
             reply_markup=main_keyboard(),
@@ -1968,6 +2596,7 @@ async def cancel_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     user_id = update.effective_user.id
 
     admin_input_state.pop(
@@ -1988,22 +2617,32 @@ async def my_chat_member_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    member_update = update.my_chat_member
+
+    member_update = (
+        update.my_chat_member
+    )
 
     if not member_update:
         return
 
     chat = member_update.chat
-    new_status = member_update.new_chat_member.status
 
-    chat_type = chat.type
+    new_status = (
+        member_update
+        .new_chat_member
+        .status
+    )
 
-    if chat_type not in (
+    if chat.type not in (
         "group",
         "supergroup",
         "channel",
     ):
         return
+
+    # ========================================================
+    # BOT ADDED / ACTIVE
+    # ========================================================
 
     if new_status in (
         ChatMemberStatus.MEMBER,
@@ -2011,27 +2650,33 @@ async def my_chat_member_handler(
         ChatMemberStatus.OWNER,
         ChatMemberStatus.RESTRICTED,
     ):
+
         await register_chat(
             chat.id,
             chat.title or str(chat.id),
-            chat_type,
+            chat.type,
         )
 
         logger.info(
-            "Registered chat: %s (%s)",
+            "Registered chat: %s (%s) type=%s",
             chat.title,
             chat.id,
+            chat.type,
         )
+
+    # ========================================================
+    # BOT LEFT / KICKED
+    # ========================================================
 
     elif new_status in (
         ChatMemberStatus.LEFT,
         ChatMemberStatus.KICKED,
     ):
+
         await deactivate_chat(
             chat.id
         )
 
-        # Stop purge if group was removed
         stop_purge_worker(
             chat.id
         )
@@ -2045,6 +2690,7 @@ async def message_watcher(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     message = update.message
 
     if not message:
@@ -2073,16 +2719,6 @@ async def channel_post_watcher(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """
-    Channel posts are NOT normal messages.
-
-    This watcher registers channels so they appear
-    in the chat-selection buttons.
-
-    IMPORTANT:
-    Channel is registered for DCLEAN only.
-    PURGE is never enabled for channels.
-    """
 
     post = update.channel_post
 
@@ -2094,6 +2730,12 @@ async def channel_post_watcher(
     if chat.type != "channel":
         return
 
+    # ========================================================
+    # CHANNEL REGISTER ONLY
+    #
+    # NO PURGE SETTINGS ARE ENABLED FOR CHANNEL.
+    # ========================================================
+
     await register_chat(
         chat.id,
         chat.title or str(chat.id),
@@ -2101,28 +2743,23 @@ async def channel_post_watcher(
     )
 
     logger.info(
-        "Channel post received: %s (%s)",
+        "Registered channel post: %s (%s)",
         chat.title,
         chat.id,
     )
 
 
 # ============================================================
-# ALL UPDATE ROUTER
+# TYPE HANDLER ROUTER
 # ============================================================
 
 async def update_router(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """
-    PTB 22.x compatible channel-post routing.
-
-    No ChannelPostHandler.
-    No custom BaseHandler.
-    """
 
     if update.channel_post:
+
         await channel_post_watcher(
             update,
             context,
@@ -2136,7 +2773,12 @@ async def update_router(
 async def post_init(
     application: Application,
 ):
+
     global telethon_client
+
+    # ========================================================
+    # CONFIG CHECK
+    # ========================================================
 
     if not BOT_TOKEN:
         raise RuntimeError(
@@ -2163,10 +2805,20 @@ async def post_init(
             "STRING_SESSION missing"
         )
 
+    # ========================================================
+    # DATABASE
+    # ========================================================
+
     await init_db()
 
+    # ========================================================
+    # TELETHON
+    # ========================================================
+
     telethon_client = TelegramClient(
-        StringSession(STRING_SESSION),
+        StringSession(
+            STRING_SESSION
+        ),
         API_ID,
         API_HASH,
     )
@@ -2174,6 +2826,7 @@ async def post_init(
     await telethon_client.connect()
 
     if not await telethon_client.is_user_authorized():
+
         raise RuntimeError(
             "STRING_SESSION is not authorized"
         )
@@ -2182,7 +2835,12 @@ async def post_init(
         "Telethon connected"
     )
 
-    # Restore only GROUP / SUPERGROUP purge workers
+    # ========================================================
+    # RESTORE PURGE
+    #
+    # GROUP/SUPERGROUP ONLY
+    # ========================================================
+
     await restore_purge_workers(
         application
     )
@@ -2199,25 +2857,38 @@ async def post_init(
 async def post_shutdown(
     application: Application,
 ):
+
     global mongo
     global telethon_client
 
+    # Cancel workers
     for task in list(
         purge_tasks.values()
     ):
-        if task and not task.done():
+
+        if (
+            task
+            and not task.done()
+        ):
             task.cancel()
 
     purge_tasks.clear()
 
+    # Disconnect Telethon
     if telethon_client:
+
         try:
             await telethon_client.disconnect()
         except Exception:
             pass
 
+    # Close Mongo
     if mongo:
-        mongo.close()
+
+        try:
+            mongo.close()
+        except Exception:
+            pass
 
     logger.info(
         "Shutdown complete"
@@ -2238,9 +2909,9 @@ def main():
         .build()
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # COMMANDS
-    # --------------------------------------------------------
+    # ========================================================
 
     application.add_handler(
         CommandHandler(
@@ -2256,9 +2927,9 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # MY CHAT MEMBER
-    # --------------------------------------------------------
+    # ========================================================
+    # BOT CHAT MEMBER
+    # ========================================================
 
     application.add_handler(
         ChatMemberHandler(
@@ -2267,9 +2938,9 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # CALLBACKS
-    # --------------------------------------------------------
+    # ========================================================
 
     application.add_handler(
         CallbackQueryHandler(
@@ -2277,9 +2948,9 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # TEXT INPUT
-    # --------------------------------------------------------
+    # ========================================================
+    # PRIVATE ADMIN TEXT INPUT
+    # ========================================================
 
     application.add_handler(
         MessageHandler(
@@ -2291,11 +2962,13 @@ def main():
         group=0,
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # CHANNEL POSTS
     #
-    # TypeHandler is the correct PTB 22.x approach here.
-    # --------------------------------------------------------
+    # Correct PTB 22.x method.
+    # NO ChannelPostHandler.
+    # NO custom BaseHandler.
+    # ========================================================
 
     application.add_handler(
         TypeHandler(
@@ -2305,9 +2978,9 @@ def main():
         group=1,
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # GROUP / SUPERGROUP WATCHER
-    # --------------------------------------------------------
+    # ========================================================
 
     application.add_handler(
         MessageHandler(
@@ -2322,9 +2995,9 @@ def main():
         group=10,
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # POLLING
-    # --------------------------------------------------------
+    # ========================================================
 
     application.run_polling(
         allowed_updates=[
@@ -2336,6 +3009,10 @@ def main():
         drop_pending_updates=False,
     )
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
