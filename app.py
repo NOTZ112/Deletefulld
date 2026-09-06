@@ -1,1168 +1,1749 @@
 import os
 import asyncio
 import logging
-from typing import Dict, Set, Optional
+from datetime import datetime, timezone, timedelta
+from html import escape
+
+from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ASCENDING
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
+from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    ContextTypes,
+    ChatMemberHandler,
     MessageHandler,
+    ChannelPostHandler,
+    ContextTypes,
     filters,
 )
-
-from motor.motor_asyncio import AsyncIOMotorClient
-
 
 # ============================================================
 # CONFIG
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "").strip()
-STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
 MONGO_URI = os.getenv("MONGO_URI", "").strip()
 
-ADMIN_IDS = {
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip().lstrip("-").isdigit()
+# EXISTING STRING SESSION
+STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
+
+try:
+    API_ID = int(os.getenv("API_ID", "0").strip())
+except Exception:
+    API_ID = 0
+
+API_HASH = os.getenv("API_HASH", "").strip()
+
+try:
+    LOG_CHAT_ID = int(os.getenv("PIPE_LOG_CHAT_ID", "0").strip())
+except Exception:
+    LOG_CHAT_ID = 0
+
+DB_NAME = "duplicate_cleaner"
+
+# DCLEAN
+DCLEAN_PROGRESS_EVERY = 500
+
+# PURGE
+PURGE_BATCH_SIZE = 100
+PURGE_PROGRESS_EVERY = 500
+DELETE_DELAY = 0.05
+
+PURGE_PRESETS = {
+    "60": 60,      # 1h
+    "75": 75,      # 1¼h
+    "90": 90,      # 1½h
+    "120": 120,    # 2h
+    "150": 150,    # 2½h
+    "165": 165,    # 2¾h
+    "180": 180,    # 3h
 }
-
-LOG_CHAT_ID = int(os.getenv("PIPE_LOG_CHAT_ID", "0"))
-
-DELETE_BATCH = 100
-PROGRESS_EVERY = 500
-DELETE_PAUSE = 0.05
-PROGRESS_EDIT_INTERVAL = 1.5
-
-# Button intervals, in minutes.
-PURGE_INTERVALS = {
-    "60": 60,       # 1 hour
-    "75": 75,       # 1¼ hours
-    "90": 90,       # 1½ hours
-    "120": 120,     # 2 hours
-    "150": 150,     # 2½ hours
-    "165": 165,     # 2¾ hours
-    "180": 180,     # 3 hours
-}
-
-CUSTOM_MIN_MINUTES = 1
-CUSTOM_MAX_MINUTES = 7 * 24 * 60
-
-
-# ============================================================
-# VALIDATION
-# ============================================================
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
-if not API_ID:
-    raise RuntimeError("API_ID is missing")
-if not API_HASH:
-    raise RuntimeError("API_HASH is missing")
-if not STRING_SESSION:
-    raise RuntimeError("STRING_SESSION is missing")
-if not MONGO_URI:
-    raise RuntimeError("MONGO_URI is missing")
-if not LOG_CHAT_ID:
-    raise RuntimeError("PIPE_LOG_CHAT_ID is missing")
-
-
-# ============================================================
-# LOGGING
-# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
 )
-logger = logging.getLogger("cleaner-bot")
+
+logger = logging.getLogger("DCLEAN-PURGE")
 
 
 # ============================================================
-# MONGO
+# ADMIN IDS FROM ENV
 # ============================================================
 
-mongo = AsyncIOMotorClient(MONGO_URI)
-db = mongo["duplicate_cleaner"]
+def parse_admin_ids(value):
+    result = set()
 
-approved_groups = db["approved_groups"]
-dclean_state = db["dclean_state"]
-media_fingerprints = db["media_fingerprints"]
-purge_settings = db["purge_settings"]
+    for item in value.split(","):
+        item = item.strip()
 
-# Stores message IDs received during the current purge cycle.
-# _id = chat_id, message_ids = [ids...], cycle_started_at = UTC datetime
-purge_cycles = db["purge_cycles"]
+        if not item:
+            continue
+
+        try:
+            result.add(int(item))
+        except ValueError:
+            logger.warning("Invalid ADMIN_IDS value: %s", item)
+
+    return result
 
 
-# ============================================================
-# TELETHON
-# ============================================================
-
-tg = TelegramClient(
-    StringSession(STRING_SESSION),
-    API_ID,
-    API_HASH,
+ENV_ADMIN_IDS = parse_admin_ids(
+    os.getenv("ADMIN_IDS", "")
 )
 
 
 # ============================================================
-# RUNTIME STATE
+# GLOBALS
 # ============================================================
 
-dclean_tasks: Dict[int, asyncio.Task] = {}
-purge_tasks: Dict[int, asyncio.Task] = {}
+mongo = None
+db = None
 
-# Admins can select a chat and then choose an action.
-admin_selected_chat: Dict[int, int] = {}
+chats_col = None
+admins_col = None
+dclean_state_col = None
+media_col = None
+pending_col = None
+purge_settings_col = None
 
-# Admin custom-time conversation state.
-pending_custom_time: Dict[int, int] = {}
+tg = None
+telegram_bot = None
 
-# Prevent two purge workers for the same chat.
-purge_locks: Dict[int, asyncio.Lock] = {}
+purge_tasks = {}
+chat_locks = {}
 
-
-# ============================================================
-# TELETHON
-# ============================================================
-
-async def ensure_tg():
-    if not tg.is_connected():
-        await tg.connect()
-
-    if not await tg.is_user_authorized():
-        raise RuntimeError("STRING_SESSION is not authorized")
-
-
-async def get_entity(chat_id: int):
-    await ensure_tg()
-    return await tg.get_entity(chat_id)
+input_states = {}
 
 
 # ============================================================
-# HELPERS
+# DATABASE
 # ============================================================
 
-def is_bot_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+async def init_database():
 
+    global mongo
+    global db
+    global chats_col
+    global admins_col
+    global dclean_state_col
+    global media_col
+    global pending_col
+    global purge_settings_col
 
-def chat_label(row: dict) -> str:
-    title = str(row.get("title") or "Unknown")
-    chat_id = int(row["_id"])
-    return f"{title} ({chat_id})"
+    if not MONGO_URI:
+        raise RuntimeError("MONGO_URI is missing")
 
+    mongo = AsyncIOMotorClient(MONGO_URI)
 
-def format_interval(minutes: int) -> str:
-    minutes = int(minutes)
-    if minutes == 60:
-        return "1 Hour"
-    if minutes == 75:
-        return "1¼ Hours"
-    if minutes == 90:
-        return "1½ Hours"
-    if minutes == 120:
-        return "2 Hours"
-    if minutes == 150:
-        return "2½ Hours"
-    if minutes == 165:
-        return "2¾ Hours"
-    if minutes == 180:
-        return "3 Hours"
+    db = mongo[DB_NAME]
 
-    hours, mins = divmod(minutes, 60)
-    if hours and mins:
-        return f"{hours}h {mins}m"
-    if hours:
-        return f"{hours}h"
-    return f"{mins}m"
+    chats_col = db["chats"]
+    admins_col = db["admins"]
+    dclean_state_col = db["dclean_state"]
+    media_col = db["media_fingerprints"]
+    pending_col = db["dclean_pending"]
+    purge_settings_col = db["purge_settings"]
 
+    await chats_col.create_index(
+        [("active", ASCENDING), ("title", ASCENDING)]
+    )
 
-async def resolve_chat_info(context, chat_id: int):
-    title = "Unknown Chat"
-    chat_type = "unknown"
+    await admins_col.create_index(
+        "user_id",
+        unique=True
+    )
 
-    try:
-        target_chat = await context.bot.get_chat(chat_id)
-        title = (
-            getattr(target_chat, "title", None)
-            or getattr(target_chat, "username", None)
-            or str(chat_id)
-        )
-        chat_type = getattr(target_chat, "type", "unknown")
-        return title, chat_type
-    except Exception as e:
-        logger.warning("Bot API could not resolve %s: %s", chat_id, e)
+    await dclean_state_col.create_index(
+        "chat_id",
+        unique=True
+    )
 
-    try:
-        entity = await get_entity(chat_id)
-        title = (
-            getattr(entity, "title", None)
-            or getattr(entity, "username", None)
-            or str(chat_id)
-        )
-        chat_type = "channel" if getattr(entity, "broadcast", False) else "group"
-    except Exception as e:
-        logger.warning("Telethon could not resolve %s: %s", chat_id, e)
+    await media_col.create_index(
+        [
+            ("chat_id", ASCENDING),
+            ("media_type", ASCENDING),
+            ("fingerprint", ASCENDING),
+        ],
+        unique=True,
+    )
 
-    return title, chat_type
+    await pending_col.create_index(
+        [
+            ("chat_id", ASCENDING),
+            ("message_id", ASCENDING),
+        ],
+        unique=True,
+    )
 
-
-async def is_dupe_approved(chat_id: int) -> bool:
-    return await approved_groups.find_one(
-        {"_id": int(chat_id), "approved_dupe": True}
-    ) is not None
-
-
-async def save_dupe_approval(chat_id: int, title: str, admin_id: int):
-    await approved_groups.update_one(
-        {"_id": int(chat_id)},
-        {
-            "$set": {
-                "title": title,
-                "approved_dupe": True,
-                "dupe_approved_by": int(admin_id),
-            }
-        },
-        upsert=True,
+    await purge_settings_col.create_index(
+        "chat_id",
+        unique=True
     )
 
 
-# ============================================================
-# PURGE DB
-# ============================================================
+async def seed_environment_admins():
 
-async def get_purge_settings(chat_id: int) -> dict:
-    row = await purge_settings.find_one({"_id": int(chat_id)})
-    return row or {
-        "_id": int(chat_id),
-        "enabled": False,
-        "interval_minutes": 60,
-    }
+    for user_id in ENV_ADMIN_IDS:
 
-
-async def set_purge_settings(chat_id: int, enabled: bool, interval_minutes: int):
-    await purge_settings.update_one(
-        {"_id": int(chat_id)},
-        {
-            "$set": {
-                "enabled": bool(enabled),
-                "interval_minutes": int(interval_minutes),
-            }
-        },
-        upsert=True,
-    )
-
-
-async def set_purge_cycle_start(chat_id: int, started_at):
-    await purge_cycles.update_one(
-        {"_id": int(chat_id)},
-        {
-            "$set": {
-                "cycle_started_at": started_at,
-                "message_ids": [],
-            }
-        },
-        upsert=True,
-    )
-
-
-async def get_purge_cycle(chat_id: int) -> dict:
-    row = await purge_cycles.find_one({"_id": int(chat_id)})
-    return row or {"_id": int(chat_id), "message_ids": []}
-
-
-async def add_purge_message_id(chat_id: int, message_id: int):
-    try:
-        await purge_cycles.update_one(
-            {"_id": int(chat_id)},
+        await admins_col.update_one(
+            {"user_id": user_id},
             {
-                "$addToSet": {
-                    "message_ids": int(message_id)
-                }
+                "$set": {
+                    "user_id": user_id,
+                    "source": "ENV",
+                    "updated_at": datetime.now(timezone.utc),
+                },
+                "$setOnInsert": {
+                    "created_at": datetime.now(timezone.utc)
+                },
             },
             upsert=True,
         )
-    except Exception as e:
-        logger.warning("Could not store purge message %s: %s", message_id, e)
 
 
-async def get_approved_chats() -> list[dict]:
-    rows = []
-    cursor = approved_groups.find(
-        {"approved_dupe": True},
-        {"title": 1, "approved_dupe": 1},
+async def is_admin(user_id):
+
+    if user_id in ENV_ADMIN_IDS:
+        return True
+
+    doc = await admins_col.find_one(
+        {"user_id": user_id}
     )
-    async for row in cursor:
-        rows.append(row)
 
-    # Also include chats with purge enabled, even if dupe was not approved.
-    cursor = purge_settings.find(
-        {"enabled": True},
-        {"_id": 1},
+    return bool(doc)
+
+
+async def get_admins():
+
+    docs = await admins_col.find({}).sort(
+        "user_id",
+        ASCENDING
+    ).to_list(length=1000)
+
+    return [
+        int(x["user_id"])
+        for x in docs
+        if x.get("user_id") is not None
+    ]
+
+
+async def add_admin(user_id, added_by):
+
+    await admins_col.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "user_id": user_id,
+                "source": "BUTTON",
+                "added_by": added_by,
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$setOnInsert": {
+                "created_at": datetime.now(timezone.utc)
+            },
+        },
+        upsert=True,
     )
-    async for row in cursor:
-        if not any(int(x["_id"]) == int(row["_id"]) for x in rows):
-            approved = await approved_groups.find_one({"_id": int(row["_id"])})
-            if approved:
-                rows.append(approved)
 
-    rows.sort(key=lambda x: str(x.get("title") or x["_id"]).lower())
-    return rows
+
+async def remove_admin(user_id):
+
+    # ADMIN_IDS from Render/Heroku Config Vars are protected.
+    if user_id in ENV_ADMIN_IDS:
+        return False
+
+    result = await admins_col.delete_one(
+        {"user_id": user_id}
+    )
+
+    return result.deleted_count > 0
 
 
 # ============================================================
-# ADMIN PANEL
+# CHAT DATABASE
 # ============================================================
 
-async def send_panel(message, context):
-    if not message:
+async def register_chat(chat):
+
+    if not chat:
         return
 
-    chats = await get_approved_chats()
-
-    if not chats:
-        await message.reply_text(
-            "🛠️ <b>ADMIN PANEL</b>\n\n"
-            "No approved groups/channels yet.\n\n"
-            "Add the bot to a group/channel and approve "
-            "♻️ DUPE from the log chat.",
-            parse_mode=ParseMode.HTML,
-        )
+    if chat.type not in (
+        "group",
+        "supergroup",
+        "channel",
+    ):
         return
 
-    buttons = []
-    for row in chats:
-        title = str(row.get("title") or row["_id"])
-        buttons.append([
-            InlineKeyboardButton(
-                f"📌 {title}",
-                callback_data=f"chat:{int(row['_id'])}",
+    chat_id = int(chat.id)
+
+    title = chat.title or str(chat_id)
+
+    await chats_col.update_one(
+        {"chat_id": chat_id},
+        {
+            "$set": {
+                "chat_id": chat_id,
+                "title": title,
+                "chat_type": chat.type,
+                "active": True,
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$setOnInsert": {
+                "created_at": datetime.now(timezone.utc)
+            },
+        },
+        upsert=True,
+    )
+
+    # Create default purge settings.
+    await purge_settings_col.update_one(
+        {"chat_id": chat_id},
+        {
+            "$setOnInsert": {
+                "chat_id": chat_id,
+                "enabled": False,
+                "minutes": 60,
+                "duplicate_delete": False,
+                "created_at": datetime.now(timezone.utc),
+            }
+        },
+        upsert=True,
+    )
+
+
+async def deactivate_chat(chat_id):
+
+    await chats_col.update_one(
+        {"chat_id": chat_id},
+        {
+            "$set": {
+                "active": False,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        }
+    )
+
+
+async def get_chat(chat_id):
+
+    return await chats_col.find_one(
+        {
+            "chat_id": int(chat_id),
+            "active": True,
+        }
+    )
+
+
+async def get_all_chats():
+
+    return await chats_col.find(
+        {"active": True}
+    ).sort(
+        "title",
+        ASCENDING
+    ).to_list(length=1000)
+
+
+# ============================================================
+# CHAT LOCK
+# ============================================================
+
+def get_chat_lock(chat_id):
+
+    chat_id = int(chat_id)
+
+    if chat_id not in chat_locks:
+        chat_locks[chat_id] = asyncio.Lock()
+
+    return chat_locks[chat_id]
+
+
+# ============================================================
+# TELETHON HELPERS
+# ============================================================
+
+async def telethon_call(factory):
+
+    while True:
+
+        try:
+            return await factory()
+
+        except FloodWaitError as e:
+
+            logger.warning(
+                "FloodWait: sleeping %s seconds",
+                e.seconds
             )
-        ])
 
-    await message.reply_text(
-        "🛠️ <b>CLEANER ADMIN PANEL</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📂 Select a group or channel:\n"
-        "━━━━━━━━━━━━━━━━━━",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_bot_admin(user.id):
-        return
-    await send_panel(update.effective_message, context)
-
-
-async def show_chat_menu(query, chat_id: int):
-    row = await approved_groups.find_one({"_id": int(chat_id)})
-    if not row:
-        row = {"_id": int(chat_id), "title": str(chat_id)}
-
-    title = str(row.get("title") or chat_id)
-    settings = await get_purge_settings(chat_id)
-
-    purge_status = "🟢 ON" if settings.get("enabled") else "🔴 OFF"
-    interval = format_interval(int(settings.get("interval_minutes", 60)))
-
-    buttons = []
-
-    if await is_dupe_approved(chat_id):
-        buttons.append([
-            InlineKeyboardButton(
-                "♻️ DUPLICATE DELETE",
-                callback_data=f"dclean:{chat_id}",
+            await asyncio.sleep(
+                e.seconds + 1
             )
-        ])
-
-    buttons.extend([
-        [
-            InlineKeyboardButton(
-                "🧹 PURGE",
-                callback_data=f"purge:{chat_id}",
-            ),
-            InlineKeyboardButton(
-                "⚙️ PURGE SETTINGS",
-                callback_data=f"psettings:{chat_id}",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🔙 BACK",
-                callback_data="back:chats",
-            )
-        ],
-    ])
-
-    await query.edit_message_text(
-        (
-            "📌 <b>CHAT PANEL</b>\n\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"📍 Name: <b>{title}</b>\n"
-            f"🆔 <code>{chat_id}</code>\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            f"🧹 Purge: <b>{purge_status}</b>\n"
-            f"⏱️ Interval: <b>{interval}</b>"
-        ),
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
 
 
-async def show_chats(query):
-    chats = await get_approved_chats()
+async def get_entity(chat_id):
 
-    if not chats:
-        await query.edit_message_text(
-            "📂 <b>NO CHATS</b>\n\n"
-            "No approved chats are available.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    buttons = []
-    for row in chats:
-        title = str(row.get("title") or row["_id"])
-        buttons.append([
-            InlineKeyboardButton(
-                f"📌 {title}",
-                callback_data=f"chat:{int(row['_id'])}",
-            )
-        ])
-
-    await query.edit_message_text(
-        "🛠️ <b>CLEANER ADMIN PANEL</b>\n\n"
-        "📂 Select a group or channel:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(buttons),
+    return await telethon_call(
+        lambda: tg.get_entity(chat_id)
     )
 
 
 # ============================================================
-# APPROVAL COMMAND
+# DCLEAN MEDIA FINGERPRINT
 # ============================================================
 
-async def approvedupe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-
-    if not message or not chat or chat.id != LOG_CHAT_ID:
-        return
-    if not user or not is_bot_admin(user.id):
-        return
-
-    if not context.args:
-        await message.reply_text(
-            "⚠️ <b>APPROVEDUPE</b>\n\n"
-            "Use:\n"
-            "<code>/approvedupe -100XXXXXXXXXX</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    try:
-        target_id = int(context.args[0])
-    except ValueError:
-        await message.reply_text("❌ Invalid Chat ID.")
-        return
-
-    title, chat_type = await resolve_chat_info(context, target_id)
-    await save_dupe_approval(target_id, title, user.id)
-
-    await message.reply_text(
-        "♻️ <b>DUPLICATE CLEAN APPROVED</b>\n\n"
-        "━━━━━━━━━━━━━━\n"
-        f"📌 Name: <b>{title}</b>\n"
-        f"🆔 <code>{target_id}</code>\n"
-        f"📂 Type: <b>{chat_type}</b>\n"
-        "━━━━━━━━━━━━━━\n\n"
-        "♻️ DCLEAN: <b>ENABLED</b>\n"
-        "🧹 PURGE: <b>OFF</b>\n\n"
-        "Use <code>/start</code> to open the button panel.",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ============================================================
-# BOT ADDED
-# ============================================================
-
-async def bot_membership_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    change = update.my_chat_member
-    if not change:
-        return
-
-    chat = change.chat
-    if chat.type not in ("group", "supergroup", "channel"):
-        return
-
-    old = change.old_chat_member
-    new = change.new_chat_member
-
-    was = old.status in ("member", "administrator")
-    now = new.status in ("member", "administrator")
-
-    if not now or was:
-        return
-
-    title = chat.title or "Unknown Chat"
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "♻️ DUPE",
-                callback_data=f"approvedupe:{chat.id}",
-            )
-        ]
-    ])
-
-    try:
-        await context.bot.send_message(
-            LOG_CHAT_ID,
-            (
-                "🤖 <b>NEW GROUP / CHANNEL ADDED</b>\n\n"
-                "━━━━━━━━━━━━━━\n"
-                f"📌 Name: <b>{title}</b>\n"
-                f"🆔 <code>{chat.id}</code>\n"
-                f"📂 Type: <b>{chat.type}</b>\n"
-                "━━━━━━━━━━━━━━\n\n"
-                "Approve Duplicate Cleaner:"
-            ),
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
-        )
-    except Exception as e:
-        logger.error("Could not send approval message: %s", e)
-
-
-# ============================================================
-# DUPLICATE MEDIA
-# ============================================================
-
-def media_key(message):
-    document = getattr(message, "document", None)
-    if document:
-        # Telethon Document uses id/access_hash/file_reference.
-        # Use Telegram's document id as the stable fingerprint.
-        return "document", str(getattr(document, "id", ""))
+def get_media_fingerprint(message):
 
     photo = getattr(message, "photo", None)
+
     if photo:
-        return "photo", str(getattr(photo, "id", ""))
+
+        return (
+            "photo",
+            str(photo.id)
+        )
+
+    document = getattr(
+        message,
+        "document",
+        None
+    )
+
+    if document:
+
+        return (
+            "document",
+            str(document.id)
+        )
 
     return None
 
 
-async def get_last_scanned_id(chat_id: int) -> int:
-    row = await dclean_state.find_one({"_id": int(chat_id)})
-    return int(row.get("last_message_id", 0)) if row else 0
+async def get_fingerprint(
+    chat_id,
+    media_type,
+    fingerprint
+):
 
-
-async def save_last_scanned_id(chat_id: int, message_id: int):
-    await dclean_state.update_one(
-        {"_id": int(chat_id)},
-        {"$set": {"last_message_id": int(message_id)}},
-        upsert=True,
+    return await media_col.find_one(
+        {
+            "chat_id": int(chat_id),
+            "media_type": media_type,
+            "fingerprint": fingerprint,
+        }
     )
 
 
 async def save_fingerprint(
-    chat_id: int,
-    media_type: str,
-    fingerprint: str,
-    message_id: int,
+    chat_id,
+    media_type,
+    fingerprint,
+    message_id
 ):
-    try:
-        await media_fingerprints.update_one(
-            {
+
+    await media_col.update_one(
+        {
+            "chat_id": int(chat_id),
+            "media_type": media_type,
+            "fingerprint": fingerprint,
+        },
+        {
+            "$setOnInsert": {
                 "chat_id": int(chat_id),
-                "media_type": str(media_type),
-                "fingerprint": str(fingerprint),
-            },
-            {
-                "$setOnInsert": {
-                    "chat_id": int(chat_id),
-                    "media_type": str(media_type),
-                    "fingerprint": str(fingerprint),
-                    "message_id": int(message_id),
-                }
-            },
-            upsert=True,
-        )
-    except Exception as e:
-        logger.warning("Fingerprint save failed: %s", e)
+                "media_type": media_type,
+                "fingerprint": fingerprint,
+                "message_id": int(message_id),
+                "created_at": datetime.now(timezone.utc),
+            }
+        },
+        upsert=True,
+    )
 
 
 # ============================================================
-# LOG EDIT
+# DCLEAN STATE
 # ============================================================
 
-async def log_edit(message, text: str):
+async def get_last_dclean_id(chat_id):
+
+    doc = await dclean_state_col.find_one(
+        {"chat_id": int(chat_id)}
+    )
+
+    if not doc:
+        return 0
+
+    return int(
+        doc.get("last_message_id", 0)
+    )
+
+
+async def save_last_dclean_id(
+    chat_id,
+    message_id
+):
+
+    await dclean_state_col.update_one(
+        {"chat_id": int(chat_id)},
+        {
+            "$set": {
+                "chat_id": int(chat_id),
+                "last_message_id": int(message_id),
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+        upsert=True,
+    )
+
+
+# ============================================================
+# DCLEAN PENDING
+# ============================================================
+
+async def add_pending(
+    chat_id,
+    message_id
+):
+
+    await pending_col.update_one(
+        {
+            "chat_id": int(chat_id),
+            "message_id": int(message_id),
+        },
+        {
+            "$set": {
+                "updated_at": datetime.now(timezone.utc)
+            },
+            "$setOnInsert": {
+                "chat_id": int(chat_id),
+                "message_id": int(message_id),
+                "created_at": datetime.now(timezone.utc),
+            },
+        },
+        upsert=True,
+    )
+
+
+async def remove_pending(
+    chat_id,
+    message_ids
+):
+
+    if not message_ids:
+        return
+
+    await pending_col.delete_many(
+        {
+            "chat_id": int(chat_id),
+            "message_id": {
+                "$in": [
+                    int(x)
+                    for x in message_ids
+                ]
+            },
+        }
+    )
+
+
+async def get_pending(chat_id):
+
+    return await pending_col.find(
+        {"chat_id": int(chat_id)}
+    ).sort(
+        "message_id",
+        ASCENDING
+    ).to_list(length=10000)
+
+
+# ============================================================
+# DELETE MESSAGES
+# ============================================================
+
+async def delete_ids(
+    entity,
+    ids
+):
+
+    if not ids:
+        return True
+
     try:
-        await message.edit_text(text, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logger.debug("Log edit failed: %s", e)
+
+        await telethon_call(
+            lambda: tg.delete_messages(
+                entity,
+                ids,
+                revoke=True
+            )
+        )
+
+        await asyncio.sleep(
+            DELETE_DELAY
+        )
+
+        return True
+
+    except RPCError:
+
+        logger.exception(
+            "Telegram RPC delete error"
+        )
+
+        return False
+
+    except Exception:
+
+        logger.exception(
+            "Delete error"
+        )
+
+        return False
 
 
 # ============================================================
 # DCLEAN
 # ============================================================
 
-async def dclean_chat(chat_id: int, log_message):
-    scanned = 0
-    duplicates = 0
-    deleted = 0
-    failed = 0
-    duplicate_ids = []
+async def run_dclean(
+    chat_id,
+    progress_message
+):
 
-    last_scanned_id = await get_last_scanned_id(chat_id)
+    lock = get_chat_lock(chat_id)
 
-    try:
-        entity = await get_entity(chat_id)
-        title = getattr(entity, "title", str(chat_id))
+    if lock.locked():
 
-        if last_scanned_id == 0:
-            await log_edit(
-                log_message,
-                "🔍 <b>FIRST DCLEAN SCAN</b>\n\n"
-                f"📌 Chat: <b>{title}</b>\n"
-                f"🆔 <code>{chat_id}</code>\n\n"
-                "📦 Scanning complete history...",
-            )
-        else:
-            await log_edit(
-                log_message,
-                "⚡ <b>INCREMENTAL DCLEAN</b>\n\n"
-                f"📌 Chat: <b>{title}</b>\n"
-                f"📍 Last scanned ID: <code>{last_scanned_id}</code>\n\n"
-                "🔍 Scanning new messages...",
-            )
-
-        seen: Set[tuple] = set()
-
-        cursor = media_fingerprints.find(
-            {"chat_id": int(chat_id)},
-            {"media_type": 1, "fingerprint": 1, "_id": 0},
+        await progress_message.edit_text(
+            "♻️ <b>DCLEAN</b>\n\n"
+            "⚠️ Another DCLEAN/PURGE job is running.",
+            parse_mode="HTML",
+            reply_markup=chat_keyboard(chat_id),
         )
-        async for row in cursor:
-            media_type = row.get("media_type")
-            fingerprint = row.get("fingerprint")
-            if media_type and fingerprint:
-                seen.add((str(media_type), str(fingerprint)))
 
-        kwargs = {"entity": entity, "reverse": True}
-        if last_scanned_id > 0:
-            kwargs["min_id"] = last_scanned_id
+        return
 
-        max_message_id = last_scanned_id
+    async with lock:
 
-        async for message in tg.iter_messages(**kwargs):
+        chat = await get_chat(chat_id)
+
+        if not chat:
+
+            await progress_message.edit_text(
+                "❌ Chat is not available.",
+                reply_markup=main_back_keyboard(),
+            )
+
+            return
+
+        entity = await get_entity(chat_id)
+
+        last_id = await get_last_dclean_id(
+            chat_id
+        )
+
+        full_scan = last_id == 0
+
+        await progress_message.edit_text(
+            "♻️ <b>DCLEAN STARTED</b>\n\n"
+            f"Mode: <b>{'FULL HISTORY' if full_scan else 'NEW MESSAGES ONLY'}</b>\n"
+            f"Last ID: <code>{last_id}</code>\n\n"
+            "Scanning...",
+            parse_mode="HTML",
+        )
+
+        scanned = 0
+        duplicate_ids = []
+        highest_id = last_id
+
+        # Oldest -> newest on first scan.
+        async for message in tg.iter_messages(
+            entity,
+            min_id=last_id if last_id else 0,
+            reverse=True,
+        ):
+
+            if not message:
+                continue
+
+            message_id = getattr(
+                message,
+                "id",
+                None
+            )
+
+            if not message_id:
+                continue
+
+            message_id = int(message_id)
+
+            highest_id = max(
+                highest_id,
+                message_id
+            )
+
             scanned += 1
-            max_message_id = max(max_message_id, int(message.id))
 
-            key = media_key(message)
-            if key is None:
+            fp = get_media_fingerprint(
+                message
+            )
+
+            if not fp:
                 continue
 
-            media_type, fingerprint = key
-            if not fingerprint:
-                continue
+            media_type, fingerprint = fp
 
-            fingerprint_key = (str(media_type), str(fingerprint))
+            existing = await get_fingerprint(
+                chat_id,
+                media_type,
+                fingerprint
+            )
 
-            if fingerprint_key in seen:
-                duplicate_ids.append(int(message.id))
-                duplicates += 1
+            if existing:
+
+                original_id = int(
+                    existing.get(
+                        "message_id",
+                        0
+                    )
+                )
+
+                if original_id != message_id:
+
+                    duplicate_ids.append(
+                        message_id
+                    )
+
+                    await add_pending(
+                        chat_id,
+                        message_id
+                    )
+
             else:
-                seen.add(fingerprint_key)
+
                 await save_fingerprint(
                     chat_id,
                     media_type,
                     fingerprint,
-                    int(message.id),
+                    message_id
                 )
 
-            if scanned % PROGRESS_EVERY == 0:
-                await log_edit(
-                    log_message,
-                    "🧹 <b>DCLEAN SCANNING</b>\n\n"
-                    f"📌 <b>{title}</b>\n\n"
-                    f"🔍 Scanned: <b>{scanned:,}</b>\n"
-                    f"♻️ Duplicates: <b>{duplicates:,}</b>\n"
-                    f"🆔 Last ID: <code>{max_message_id}</code>",
+            if scanned % DCLEAN_PROGRESS_EVERY == 0:
+
+                await progress_message.edit_text(
+                    "♻️ <b>DCLEAN SCANNING</b>\n\n"
+                    f"Scanned: <code>{scanned}</code>\n"
+                    f"Duplicates: <code>{len(duplicate_ids)}</code>\n"
+                    f"Last ID: <code>{highest_id}</code>",
+                    parse_mode="HTML",
                 )
-                await asyncio.sleep(0)
 
-        if max_message_id > last_scanned_id:
-            await save_last_scanned_id(chat_id, max_message_id)
+        # Retry old failed duplicates.
+        pending_docs = await get_pending(
+            chat_id
+        )
 
-        total = len(duplicate_ids)
+        pending_ids = [
+            int(x["message_id"])
+            for x in pending_docs
+        ]
 
-        if not duplicate_ids:
-            await log_edit(
-                log_message,
-                "✅ <b>DCLEAN COMPLETED</b>\n\n"
-                f"📌 <b>{title}</b>\n\n"
-                f"📨 Scanned: <b>{scanned:,}</b>\n"
-                "♻️ Duplicates: <b>0</b>\n"
-                "🗑️ Deleted: <b>0</b>\n\n"
-                "✅ No duplicate files found.",
+        all_delete_ids = sorted(
+            set(
+                duplicate_ids +
+                pending_ids
             )
-            return
-
-        await log_edit(
-            log_message,
-            "🗑️ <b>DELETING DUPLICATES</b>\n\n"
-            f"📌 <b>{title}</b>\n\n"
-            f"🔍 Scanned: <b>{scanned:,}</b>\n"
-            f"♻️ Duplicates: <b>{total:,}</b>\n"
-            "🗑️ Deleted: <b>0</b>\n"
-            f"⏳ Remaining: <b>{total:,}</b>",
         )
 
-        for start in range(0, total, DELETE_BATCH):
-            batch = duplicate_ids[start:start + DELETE_BATCH]
+        deleted = 0
+        failed = 0
 
-            while True:
-                try:
-                    await tg.delete_messages(
-                        entity,
-                        batch,
-                        revoke=True,
-                    )
-                    deleted += len(batch)
-                    break
+        for start in range(
+            0,
+            len(all_delete_ids),
+            PURGE_BATCH_SIZE
+        ):
 
-                except FloodWaitError as e:
-                    await log_edit(
-                        log_message,
-                        "⏳ <b>TELEGRAM FLOOD WAIT</b>\n\n"
-                        f"Waiting <b>{e.seconds}s</b>...\n\n"
-                        f"🗑️ Deleted: <b>{deleted:,}</b>\n"
-                        f"⏳ Remaining: <b>{max(total-deleted, 0):,}</b>",
-                    )
-                    await asyncio.sleep(e.seconds)
+            batch = all_delete_ids[
+                start:
+                start + PURGE_BATCH_SIZE
+            ]
 
-                except RPCError as e:
-                    logger.error("Delete RPC error: %s", e)
-                    failed += len(batch)
-                    break
-
-                except Exception as e:
-                    logger.exception("Delete error: %s", e)
-                    failed += len(batch)
-                    break
-
-            await log_edit(
-                log_message,
-                "🧹 <b>DCLEAN PROGRESS</b>\n\n"
-                f"📌 <b>{title}</b>\n\n"
-                f"🔍 Scanned: <b>{scanned:,}</b>\n"
-                f"♻️ Duplicates: <b>{total:,}</b>\n"
-                f"🗑️ Deleted: <b>{deleted:,}</b>\n"
-                f"❌ Failed: <b>{failed:,}</b>\n"
-                f"⏳ Remaining: <b>{max(total-deleted, 0):,}</b>",
+            success = await delete_ids(
+                entity,
+                batch
             )
-            await asyncio.sleep(DELETE_PAUSE)
 
-        await log_edit(
-            log_message,
-            "✅ <b>DUPLICATE CLEAN COMPLETED</b>\n\n"
-            f"📌 <b>{title}</b>\n"
-            f"🆔 <code>{chat_id}</code>\n\n"
-            f"🔍 Scanned: <b>{scanned:,}</b>\n"
-            f"♻️ Duplicates: <b>{total:,}</b>\n"
-            f"🗑️ Deleted: <b>{deleted:,}</b>\n"
-            f"❌ Failed: <b>{failed:,}</b>\n\n"
-            "✅ Duplicate files removed.",
-        )
+            if success:
 
-    except Exception as e:
-        logger.exception("DCLEAN failed")
-        await log_edit(
-            log_message,
-            "❌ <b>DCLEAN FAILED</b>\n\n"
-            f"🆔 <code>{chat_id}</code>\n\n"
-            f"<code>{str(e)[:1200]}</code>",
-        )
-
-
-# ============================================================
-# START DCLEAN
-# ============================================================
-
-async def start_dclean(query, chat_id: int):
-    if not await is_dupe_approved(chat_id):
-        await query.answer(
-            "Duplicate Cleaner is not approved for this chat.",
-            show_alert=True,
-        )
-        return
-
-    old = dclean_tasks.get(chat_id)
-    if old and not old.done():
-        await query.answer(
-            "DCLEAN is already running for this chat.",
-            show_alert=True,
-        )
-        return
-
-    log_message = await query.message.reply_text(
-        "🧹 <b>DCLEAN STARTED</b>\n\n"
-        f"🆔 <code>{chat_id}</code>\n\n"
-        "🔍 Scanning...",
-        parse_mode=ParseMode.HTML,
-    )
-
-    task = asyncio.create_task(dclean_chat(chat_id, log_message))
-    dclean_tasks[chat_id] = task
-    await query.answer("DCLEAN started.")
-
-
-# ============================================================
-# PURGE CYCLE
-# ============================================================
-
-async def purge_messages(chat_id: int, message_ids: list[int], title: str, log_message):
-    unique_ids = list(dict.fromkeys(int(x) for x in message_ids))
-    total = len(unique_ids)
-    deleted = 0
-    failed = 0
-
-    if total == 0:
-        await log_edit(
-            log_message,
-            "ℹ️ <b>PURGE COMPLETED</b>\n\n"
-            f"📌 <b>{title}</b>\n\n"
-            "📨 Messages in cycle: <b>0</b>\n"
-            "🗑️ Deleted: <b>0</b>\n\n"
-            "Nothing to delete.",
-        )
-        return
-
-    entity = await get_entity(chat_id)
-
-    for start in range(0, total, DELETE_BATCH):
-        batch = unique_ids[start:start + DELETE_BATCH]
-
-        while True:
-            try:
-                await tg.delete_messages(
-                    entity,
-                    batch,
-                    revoke=True,
-                )
                 deleted += len(batch)
-                break
 
-            except FloodWaitError as e:
-                await log_edit(
-                    log_message,
-                    "⏳ <b>PURGE FLOOD WAIT</b>\n\n"
-                    f"📌 <b>{title}</b>\n"
-                    f"⏳ Waiting <b>{e.seconds}s</b>...\n\n"
-                    f"📨 Total: <b>{total:,}</b>\n"
-                    f"🗑️ Deleted: <b>{deleted:,}</b>\n"
-                    f"⏳ Remaining: <b>{max(total-deleted, 0):,}</b>",
+                await remove_pending(
+                    chat_id,
+                    batch
                 )
-                await asyncio.sleep(e.seconds)
 
-            except RPCError as e:
-                logger.error("Purge RPC error: %s", e)
+            else:
+
                 failed += len(batch)
-                break
 
-            except Exception as e:
-                logger.exception("Purge delete error: %s", e)
-                failed += len(batch)
-                break
+            await progress_message.edit_text(
+                "♻️ <b>DCLEAN DELETE</b>\n\n"
+                f"Scanned: <code>{scanned}</code>\n"
+                f"Found: <code>{len(all_delete_ids)}</code>\n"
+                f"Deleted: <code>{deleted}</code>\n"
+                f"Remaining: <code>{len(all_delete_ids) - deleted}</code>",
+                parse_mode="HTML",
+            )
 
-        await log_edit(
-            log_message,
-            "🧹 <b>PURGE PROCESSING</b>\n\n"
-            f"📌 <b>{title}</b>\n\n"
-            f"📨 Messages: <b>{total:,}</b>\n"
-            f"🗑️ Deleted: <b>{deleted:,}</b>\n"
-            f"❌ Failed: <b>{failed:,}</b>\n"
-            f"⏳ Remaining: <b>{max(total-deleted, 0):,}</b>",
+        # Save the scan position.
+        if highest_id > last_id:
+
+            await save_last_dclean_id(
+                chat_id,
+                highest_id
+            )
+
+        await progress_message.edit_text(
+            "♻️ <b>DCLEAN COMPLETE</b>\n\n"
+            f"Scanned: <code>{scanned}</code>\n"
+            f"Duplicates: <code>{len(all_delete_ids)}</code>\n"
+            f"Deleted: <code>{deleted}</code>\n"
+            f"Failed: <code>{failed}</code>\n"
+            f"Last scanned ID: <code>{highest_id}</code>",
+            parse_mode="HTML",
+            reply_markup=chat_keyboard(chat_id),
         )
-        await asyncio.sleep(DELETE_PAUSE)
 
-    await log_edit(
-        log_message,
-        "✅ <b>PURGE COMPLETED</b>\n\n"
-        f"📌 <b>{title}</b>\n\n"
-        f"📨 Messages in cycle: <b>{total:,}</b>\n"
-        f"🗑️ Deleted: <b>{deleted:,}</b>\n"
-        f"❌ Failed: <b>{failed:,}</b>\n\n"
-        "🔄 Next purge cycle is now active.",
+
+# ============================================================
+# PURGE SETTINGS
+# ============================================================
+
+async def get_purge_settings(chat_id):
+
+    doc = await purge_settings_col.find_one(
+        {"chat_id": int(chat_id)}
+    )
+
+    if doc:
+        return doc
+
+    default = {
+        "chat_id": int(chat_id),
+        "enabled": False,
+        "minutes": 60,
+        "duplicate_delete": False,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+    await purge_settings_col.insert_one(
+        default
+    )
+
+    return default
+
+
+async def save_purge_settings(
+    chat_id,
+    **values
+):
+
+    values["updated_at"] = datetime.now(
+        timezone.utc
+    )
+
+    await purge_settings_col.update_one(
+        {"chat_id": int(chat_id)},
+        {
+            "$set": values,
+            "$setOnInsert": {
+                "chat_id": int(chat_id)
+            },
+        },
+        upsert=True,
     )
 
 
-async def purge_worker(chat_id: int):
-    lock = purge_locks.setdefault(chat_id, asyncio.Lock())
+def duration_text(minutes):
+
+    mapping = {
+        60: "1h",
+        75: "1¼h",
+        90: "1½h",
+        120: "2h",
+        150: "2½h",
+        165: "2¾h",
+        180: "3h",
+    }
+
+    if minutes in mapping:
+        return mapping[minutes]
+
+    if minutes >= 60:
+
+        hours = minutes // 60
+        rem = minutes % 60
+
+        if rem:
+            return f"{hours}h {rem}m"
+
+        return f"{hours}h"
+
+    return f"{minutes}m"
+
+
+# ============================================================
+# PURGE
+# ============================================================
+
+async def run_purge(
+    chat_id,
+    minutes,
+    duplicate_delete=False,
+    progress_message=None,
+):
+
+    lock = get_chat_lock(chat_id)
+
+    if lock.locked():
+
+        if progress_message:
+
+            await progress_message.edit_text(
+                "🗑️ <b>PURGE</b>\n\n"
+                "⚠️ Another DCLEAN/PURGE job is already running.",
+                parse_mode="HTML",
+                reply_markup=chat_keyboard(chat_id),
+            )
+
+        return
 
     async with lock:
-        while True:
-            settings = await get_purge_settings(chat_id)
 
-            if not settings.get("enabled"):
-                return
+        chat = await get_chat(chat_id)
 
-            interval = int(settings.get("interval_minutes", 60))
-            if interval < CUSTOM_MIN_MINUTES:
-                interval = 60
+        if not chat:
+            return
 
-            # Each worker starts a new cycle. Messages received after this
-            # point belong to the new cycle and are not part of this purge.
-            from datetime import datetime, timezone
+        entity = await get_entity(
+            chat_id
+        )
 
-            cycle_started = datetime.now(timezone.utc)
-            await set_purge_cycle_start(chat_id, cycle_started)
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(minutes=minutes)
+        )
 
-            logger.info(
-                "Purge cycle started for %s; interval=%s minutes",
-                chat_id,
-                interval,
+        scanned = 0
+        deleted = 0
+        failed = 0
+
+        old_ids = []
+
+        if progress_message:
+
+            await progress_message.edit_text(
+                "🗑️ <b>PURGE STARTED</b>\n\n"
+                f"Delete older than: <b>{duration_text(minutes)}</b>\n"
+                f"Duplicate Delete: <b>{'ON' if duplicate_delete else 'OFF'}</b>\n\n"
+                "Scanning...",
+                parse_mode="HTML",
             )
 
-            await asyncio.sleep(interval * 60)
+        # ----------------------------------------------------
+        # AGE PURGE
+        # ----------------------------------------------------
 
-            settings = await get_purge_settings(chat_id)
-            if not settings.get("enabled"):
-                return
+        async for message in tg.iter_messages(
+            entity
+        ):
 
-            # If the interval was changed while sleeping, restart the cycle
-            # using the new interval rather than deleting unexpectedly.
-            current_interval = int(settings.get("interval_minutes", 60))
-            if current_interval != interval:
+            if not message:
                 continue
 
-            cycle = await get_purge_cycle(chat_id)
-            message_ids = cycle.get("message_ids", [])
-
-            title_row = await approved_groups.find_one({"_id": int(chat_id)})
-            title = (
-                str(title_row.get("title"))
-                if title_row and title_row.get("title")
-                else str(chat_id)
+            message_id = getattr(
+                message,
+                "id",
+                None
             )
 
-            try:
-                log_message = await tg_bot.send_message(
-                    LOG_CHAT_ID,
-                    "🧹 <b>PURGE STARTED</b>\n\n"
-                    f"📌 <b>{title}</b>\n"
-                    f"🆔 <code>{chat_id}</code>\n\n"
-                    f"⏱️ Cycle: <b>{format_interval(interval)}</b>\n"
-                    f"📨 Messages: <b>{len(message_ids):,}</b>\n"
-                    "🗑️ Deleted: <b>0</b>",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception as e:
-                logger.error("Could not create purge log: %s", e)
-                log_message = None
+            if not message_id:
+                continue
 
-            # Clear the cycle BEFORE deleting. New messages are now stored in
-            # the next cycle while this batch is being deleted.
-            await set_purge_cycle_start(
+            scanned += 1
+
+            msg_date = getattr(
+                message,
+                "date",
+                None
+            )
+
+            if not msg_date:
+                continue
+
+            if msg_date.tzinfo is None:
+
+                msg_date = msg_date.replace(
+                    tzinfo=timezone.utc
+                )
+
+            if msg_date < cutoff:
+
+                old_ids.append(
+                    int(message_id)
+                )
+
+            else:
+                # Newest -> oldest, so once we cross
+                # the cutoff we can stop.
+                break
+
+            if (
+                scanned %
+                PURGE_PROGRESS_EVERY
+                == 0
+            ):
+
+                if progress_message:
+
+                    await progress_message.edit_text(
+                        "🧹 <b>PURGE SCANNING</b>\n\n"
+                        f"Scanned: <code>{scanned}</code>\n"
+                        f"To delete: <code>{len(old_ids)}</code>\n"
+                        f"Deleted: <code>{deleted}</code>",
+                        parse_mode="HTML",
+                    )
+
+        # ----------------------------------------------------
+        # OPTIONAL DUPLICATE DELETE
+        # ----------------------------------------------------
+
+        if duplicate_delete:
+
+            seen = set()
+
+            async for message in tg.iter_messages(
+                entity
+            ):
+
+                fp = get_media_fingerprint(
+                    message
+                )
+
+                if not fp:
+                    continue
+
+                media_type, fingerprint = fp
+
+                key = (
+                    media_type,
+                    fingerprint
+                )
+
+                if key in seen:
+
+                    old_ids.append(
+                        int(message.id)
+                    )
+
+                else:
+
+                    seen.add(key)
+
+        delete_ids_list = sorted(
+            set(old_ids),
+            reverse=True
+        )
+
+        total = len(delete_ids_list)
+
+        # ----------------------------------------------------
+        # DELETE
+        # ----------------------------------------------------
+
+        for start in range(
+            0,
+            total,
+            PURGE_BATCH_SIZE
+        ):
+
+            batch = delete_ids_list[
+                start:
+                start + PURGE_BATCH_SIZE
+            ]
+
+            success = await delete_ids(
+                entity,
+                batch
+            )
+
+            if success:
+
+                deleted += len(batch)
+
+            else:
+
+                failed += len(batch)
+
+            remaining = max(
+                0,
+                total - deleted - failed
+            )
+
+            if progress_message:
+
+                await progress_message.edit_text(
+                    "🗑️ <b>PURGE DELETE</b>\n\n"
+                    f"Age: <b>{duration_text(minutes)}</b>\n"
+                    f"Scanned: <code>{scanned}</code>\n"
+                    f"Deleted: <code>{deleted}</code>\n"
+                    f"Failed: <code>{failed}</code>\n"
+                    f"Remaining: <code>{remaining}</code>",
+                    parse_mode="HTML",
+                )
+
+        if progress_message:
+
+            await progress_message.edit_text(
+                "🗑️ <b>PURGE COMPLETE</b>\n\n"
+                f"Age: <b>{duration_text(minutes)}</b>\n"
+                f"Scanned: <code>{scanned}</code>\n"
+                f"Deleted: <code>{deleted}</code>\n"
+                f"Failed: <code>{failed}</code>\n"
+                f"Remaining: <code>{max(0, total - deleted - failed)}</code>",
+                parse_mode="HTML",
+                reply_markup=chat_keyboard(chat_id),
+            )
+
+
+# ============================================================
+# PURGE WORKER
+# ============================================================
+
+async def purge_worker(chat_id):
+
+    logger.info(
+        "Purge worker started: %s",
+        chat_id
+    )
+
+    while True:
+
+        try:
+
+            settings = await get_purge_settings(
+                chat_id
+            )
+
+            if not settings.get(
+                "enabled",
+                False
+            ):
+                break
+
+            minutes = int(
+                settings.get(
+                    "minutes",
+                    60
+                )
+            )
+
+            duplicate_delete = bool(
+                settings.get(
+                    "duplicate_delete",
+                    False
+                )
+            )
+
+            # Check once per minute.
+            await asyncio.sleep(60)
+
+            settings = await get_purge_settings(
+                chat_id
+            )
+
+            if not settings.get(
+                "enabled",
+                False
+            ):
+                break
+
+            await run_purge(
                 chat_id,
-                __import__("datetime").datetime.now(
-                    __import__("datetime").timezone.utc
-                ),
+                minutes,
+                duplicate_delete,
+                None,
             )
 
-            if log_message:
-                await purge_messages(
-                    chat_id,
-                    message_ids,
-                    title,
-                    log_message,
+        except asyncio.CancelledError:
+
+            raise
+
+        except Exception:
+
+            logger.exception(
+                "Purge worker crashed"
+            )
+
+            await asyncio.sleep(
+                30
+            )
+
+    purge_tasks.pop(
+        chat_id,
+        None
+    )
+
+    logger.info(
+        "Purge worker stopped: %s",
+        chat_id
+    )
+
+
+def ensure_purge_worker(chat_id):
+
+    task = purge_tasks.get(
+        chat_id
+    )
+
+    if task and not task.done():
+        return
+
+    purge_tasks[chat_id] = asyncio.create_task(
+        purge_worker(chat_id)
+    )
+
+
+async def stop_purge_worker(chat_id):
+
+    task = purge_tasks.get(
+        chat_id
+    )
+
+    if task and not task.done():
+
+        task.cancel()
+
+        try:
+            await task
+
+        except asyncio.CancelledError:
+            pass
+
+    purge_tasks.pop(
+        chat_id,
+        None
+    )
+
+
+async def restore_purge_workers():
+
+    docs = await purge_settings_col.find(
+        {"enabled": True}
+    ).to_list(
+        length=10000
+    )
+
+    restored = 0
+
+    for doc in docs:
+
+        chat_id = int(
+            doc["chat_id"]
+        )
+
+        chat = await get_chat(
+            chat_id
+        )
+
+        if chat:
+
+            ensure_purge_worker(
+                chat_id
+            )
+
+            restored += 1
+
+    logger.info(
+        "Restored purge workers: %s",
+        restored
+    )
+
+
+# ============================================================
+# KEYBOARDS
+# ============================================================
+
+def main_keyboard():
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "👥 GROUPS / CHANNELS",
+                    callback_data="chats"
                 )
+            ],
+            [
+                InlineKeyboardButton(
+                    "👤 ADMIN MANAGEMENT",
+                    callback_data="admins"
+                )
+            ],
+        ]
+    )
 
-            # Continue immediately into the next fixed-length cycle.
+
+def main_back_keyboard():
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "⬅️ MAIN",
+                    callback_data="main"
+                )
+            ]
+        ]
+    )
+
+
+async def chats_keyboard():
+
+    chats = await get_all_chats()
+
+    rows = []
+
+    for chat in chats:
+
+        chat_id = int(
+            chat["chat_id"]
+        )
+
+        title = chat.get(
+            "title",
+            str(chat_id)
+        )
+
+        chat_type = chat.get(
+            "chat_type",
+            ""
+        )
+
+        icon = (
+            "📢"
+            if chat_type == "channel"
+            else "👥"
+        )
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{icon} {title[:55]}",
+                    callback_data=f"chat:{chat_id}"
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🔄 REFRESH",
+                callback_data="chats"
+            )
+        ]
+    )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "⬅️ MAIN",
+                callback_data="main"
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        rows
+    )
+
+
+def chat_keyboard(chat_id):
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "♻️ DCLEAN",
+                    callback_data=f"dclean:{chat_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🗑️ PURGE",
+                    callback_data=f"purge:{chat_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📊 STATUS",
+                    callback_data=f"status:{chat_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔄 REFRESH",
+                    callback_data=f"chat:{chat_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ BACK",
+                    callback_data="chats"
+                )
+            ],
+        ]
+    )
+
+
+def purge_keyboard(
+    chat_id,
+    enabled,
+    duplicate_delete
+):
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "1h",
+                    callback_data=f"pm:{chat_id}:60"
+                ),
+                InlineKeyboardButton(
+                    "1¼h",
+                    callback_data=f"pm:{chat_id}:75"
+                ),
+                InlineKeyboardButton(
+                    "1½h",
+                    callback_data=f"pm:{chat_id}:90"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "2h",
+                    callback_data=f"pm:{chat_id}:120"
+                ),
+                InlineKeyboardButton(
+                    "2½h",
+                    callback_data=f"pm:{chat_id}:150"
+                ),
+                InlineKeyboardButton(
+                    "2¾h",
+                    callback_data=f"pm:{chat_id}:165"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "3h",
+                    callback_data=f"pm:{chat_id}:180"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⚙️ CUSTOM MINUTES",
+                    callback_data=f"custom:{chat_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    (
+                        "♻️ DUPLICATE DELETE: ON"
+                        if duplicate_delete
+                        else
+                        "♻️ DUPLICATE DELETE: OFF"
+                    ),
+                    callback_data=f"dup:{chat_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    (
+                        "⏹️ DISABLE PURGE"
+                        if enabled
+                        else
+                        "▶️ ENABLE PURGE"
+                    ),
+                    callback_data=f"toggle:{chat_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "▶️ RUN PURGE NOW",
+                    callback_data=f"runpurge:{chat_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ BACK",
+                    callback_data=f"chat:{chat_id}"
+                )
+            ],
+        ]
+    )
 
 
 # ============================================================
-# MESSAGE CAPTURE FOR PURGE
+# UI HELPERS
 # ============================================================
 
-async def purge_message_capture(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    if not message:
-        return
-
-    chat = update.effective_chat
-    if not chat:
-        return
-
-    settings = await get_purge_settings(chat.id)
-    if not settings.get("enabled"):
-        return
-
-    # Store every message in the current purge cycle.
-    # This handler runs for normal group messages and channel posts.
-    await add_purge_message_id(chat.id, message.id)
-
-
-# ============================================================
-# PURGE SETTINGS UI
-# ============================================================
-
-async def show_purge_settings(query, chat_id: int):
-    row = await approved_groups.find_one({"_id": int(chat_id)})
-    title = str(row.get("title") if row else chat_id)
-
-    settings = await get_purge_settings(chat_id)
-    enabled = bool(settings.get("enabled"))
-    interval = int(settings.get("interval_minutes", 60))
-
-    status = "🟢 ON" if enabled else "🔴 OFF"
-
-    keyboard = [
-        [
-            InlineKeyboardButton("🕐 1 Hour", callback_data=f"ptime:{chat_id}:60"),
-            InlineKeyboardButton("🕜 1¼ Hours", callback_data=f"ptime:{chat_id}:75"),
-        ],
-        [
-            InlineKeyboardButton("🕝 1½ Hours", callback_data=f"ptime:{chat_id}:90"),
-            InlineKeyboardButton("🕑 2 Hours", callback_data=f"ptime:{chat_id}:120"),
-        ],
-        [
-            InlineKeyboardButton("🕝 2½ Hours", callback_data=f"ptime:{chat_id}:150"),
-            InlineKeyboardButton("🕝 2¾ Hours", callback_data=f"ptime:{chat_id}:165"),
-        ],
-        [
-            InlineKeyboardButton("🕒 3 Hours", callback_data=f"ptime:{chat_id}:180"),
-        ],
-        [
-            InlineKeyboardButton("⚙️ CUSTOM TIME", callback_data=f"pcustom:{chat_id}"),
-        ],
-        [
-            InlineKeyboardButton("🟢 ENABLE PURGE", callback_data=f"penable:{chat_id}"),
-            InlineKeyboardButton("🔴 DISABLE PURGE", callback_data=f"pdisable:{chat_id}"),
-        ],
-        [
-            InlineKeyboardButton("🔙 BACK", callback_data=f"chat:{chat_id}"),
-        ],
-    ]
+async def show_chat_list(query):
 
     await query.edit_message_text(
-        "🧹 <b>PURGE SETTINGS</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"📌 <b>{title}</b>\n"
-        f"🧹 Status: <b>{status}</b>\n"
-        f"⏱️ Interval: <b>{format_interval(interval)}</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "Select how often the current cycle is fully cleared.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        "👥 <b>GROUPS / CHANNELS</b>\n\n"
+        "Select a chat:",
+        parse_mode="HTML",
+        reply_markup=await chats_keyboard(),
     )
 
 
-async def set_purge_interval_from_button(query, chat_id: int, minutes: int):
-    await set_purge_settings(chat_id, True, minutes)
+async def show_chat_panel(
+    query,
+    chat_id
+):
 
-    old = purge_tasks.get(chat_id)
-    if old and not old.done():
-        old.cancel()
-
-    purge_tasks[chat_id] = asyncio.create_task(purge_worker(chat_id))
-
-    await query.answer(f"Purge enabled: {format_interval(minutes)}")
-    await show_purge_settings(query, chat_id)
-
-
-async def disable_purge(query, chat_id: int):
-    await set_purge_settings(chat_id, False, 60)
-
-    old = purge_tasks.get(chat_id)
-    if old and not old.done():
-        old.cancel()
-
-    purge_tasks.pop(chat_id, None)
-
-    await query.answer("Purge disabled.")
-    await show_purge_settings(query, chat_id)
-
-
-# ============================================================
-# CUSTOM TIME
-# ============================================================
-
-async def custom_time_prompt(query, chat_id: int):
-    pending_custom_time[query.from_user.id] = chat_id
-
-    await query.answer()
-    await query.message.reply_text(
-        "⚙️ <b>CUSTOM PURGE TIME</b>\n\n"
-        "Send the interval in minutes.\n\n"
-        "Examples:\n"
-        "<code>90</code> = 1½ Hours\n"
-        "<code>150</code> = 2½ Hours\n\n"
-        f"Allowed: <b>{CUSTOM_MIN_MINUTES}</b>–"
-        f"<b>{CUSTOM_MAX_MINUTES}</b> minutes.",
-        parse_mode=ParseMode.HTML,
+    chat = await get_chat(
+        chat_id
     )
 
+    if not chat:
 
-async def custom_time_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    message = update.effective_message
-
-    if not user or not message or not is_bot_admin(user.id):
-        return
-
-    chat_id = pending_custom_time.get(user.id)
-    if not chat_id:
-        return
-
-    raw = (message.text or "").strip()
-
-    try:
-        minutes = int(raw)
-    except ValueError:
-        await message.reply_text("❌ Send only the number of minutes, e.g. <code>90</code>.", parse_mode=ParseMode.HTML)
-        return
-
-    if not CUSTOM_MIN_MINUTES <= minutes <= CUSTOM_MAX_MINUTES:
-        await message.reply_text(
-            f"❌ Enter a value between {CUSTOM_MIN_MINUTES} and {CUSTOM_MAX_MINUTES} minutes."
+        await query.edit_message_text(
+            "❌ Chat not found.",
+            reply_markup=await chats_keyboard()
         )
+
         return
 
-    pending_custom_time.pop(user.id, None)
+    settings = await get_purge_settings(
+        chat_id
+    )
 
-    await set_purge_settings(chat_id, True, minutes)
+    title = escape(
+        chat.get(
+            "title",
+            str(chat_id)
+        )
+    )
 
-    old = purge_tasks.get(chat_id)
-    if old and not old.done():
-        old.cancel()
+    chat_type = escape(
+        chat.get(
+            "chat_type",
+            "unknown"
+        )
+    )
 
-    purge_tasks[chat_id] = asyncio.create_task(purge_worker(chat_id))
+    enabled = (
+        "ON"
+        if settings.get("enabled")
+        else
+        "OFF"
+    )
 
-    await message.reply_text(
-        "✅ <b>PURGE ENABLED</b>\n\n"
-        f"📌 Chat ID: <code>{chat_id}</code>\n"
-        f"⏱️ Interval: <b>{format_interval(minutes)}</b>\n\n"
-        "🔄 A new cycle has started.",
-        parse_mode=ParseMode.HTML,
+    minutes = int(
+        settings.get(
+            "minutes",
+            60
+        )
+    )
+
+    duplicate = (
+        "ON"
+        if settings.get(
+            "duplicate_delete"
+        )
+        else
+        "OFF"
+    )
+
+    await query.edit_message_text(
+        f"📂 <b>{title}</b>\n\n"
+        f"Type: <code>{chat_type}</code>\n"
+        f"ID: <code>{chat_id}</code>\n\n"
+        f"🗑️ Purge: <b>{enabled}</b>\n"
+        f"⏱️ Age: <b>{duration_text(minutes)}</b>\n"
+        f"♻️ Duplicate Delete: <b>{duplicate}</b>",
+        parse_mode="HTML",
+        reply_markup=chat_keyboard(
+            chat_id
+        ),
+    )
+
+
+async def show_purge_menu(
+    query,
+    chat_id
+):
+
+    settings = await get_purge_settings(
+        chat_id
+    )
+
+    enabled = bool(
+        settings.get(
+            "enabled",
+            False
+        )
+    )
+
+    duplicate_delete = bool(
+        settings.get(
+            "duplicate_delete",
+            False
+        )
+    )
+
+    minutes = int(
+        settings.get(
+            "minutes",
+            60
+        )
+    )
+
+    await query.edit_message_text(
+        "🗑️ <b>PURGE SETTINGS</b>\n\n"
+        f"Current age: <b>{duration_text(minutes)}</b>\n"
+        f"Enabled: <b>{'ON' if enabled else 'OFF'}</b>\n"
+        f"Duplicate Delete: <b>{'ON' if duplicate_delete else 'OFF'}</b>\n\n"
+        "Select purge age:",
+        parse_mode="HTML",
+        reply_markup=purge_keyboard(
+            chat_id,
+            enabled,
+            duplicate_delete
+        ),
+    )
+
+
+# ============================================================
+# ADMIN UI
+# ============================================================
+
+async def show_admin_panel(query):
+
+    admins = await get_admins()
+
+    lines = [
+        "👤 <b>ADMIN MANAGEMENT</b>",
+        "",
+    ]
+
+    for user_id in admins:
+
+        source = (
+            "ENV"
+            if user_id in ENV_ADMIN_IDS
+            else
+            "MONGO"
+        )
+
+        lines.append(
+            f"• <code>{user_id}</code> — {source}"
+        )
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "➕ ADD ADMIN",
+                        callback_data="addadmin"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "❌ REMOVE ADMIN",
+                        callback_data="removeadmin"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔄 REFRESH",
+                        callback_data="admins"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ MAIN",
+                        callback_data="main"
+                    )
+                ],
+            ]
+        ),
+    )
+
+
+# ============================================================
+# /START
+# ============================================================
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user = update.effective_user
+
+    if not user:
+        return
+
+    if not await is_admin(
+        user.id
+    ):
+        return
+
+    await update.message.reply_text(
+        "🤖 <b>DCLEAN + PURGE ADMIN PANEL</b>\n\n"
+        "Select an option:",
+        parse_mode="HTML",
+        reply_markup=main_keyboard(),
+    )
+
+
+async def cancel_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user = update.effective_user
+
+    if not user:
+        return
+
+    if not await is_admin(
+        user.id
+    ):
+        return
+
+    input_states.pop(
+        user.id,
+        None
+    )
+
+    await update.message.reply_text(
+        "❌ Cancelled.",
+        reply_markup=main_keyboard()
     )
 
 
@@ -1170,212 +1751,766 @@ async def custom_time_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 # CALLBACK HANDLER
 # ============================================================
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callback_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     query = update.callback_query
-    if not query:
-        return
 
     user = query.from_user
-    if not user or not is_bot_admin(user.id):
-        await query.answer("❌ Not authorized", show_alert=True)
+
+    if not await is_admin(
+        user.id
+    ):
+
+        await query.answer(
+            "Not authorized.",
+            show_alert=True
+        )
+
         return
+
+    await query.answer()
 
     data = query.data or ""
 
-    try:
-        if data == "back:chats":
-            await query.answer()
-            await show_chats(query)
-            return
+    # MAIN
+    if data == "main":
 
-        if data.startswith("approvedupe:"):
-            chat_id = int(data.split(":", 1)[1])
+        await query.edit_message_text(
+            "🤖 <b>DCLEAN + PURGE ADMIN PANEL</b>\n\n"
+            "Select an option:",
+            parse_mode="HTML",
+            reply_markup=main_keyboard(),
+        )
 
-            title_row = await approved_groups.find_one({"_id": chat_id})
-            title = str(title_row.get("title")) if title_row else str(chat_id)
+        return
 
-            # If the approval came from the new-group message, refresh title.
-            if not title_row:
-                title, _ = await resolve_chat_info(context, chat_id)
+    # CHAT LIST
+    if data == "chats":
 
-            await save_dupe_approval(chat_id, title, user.id)
-            await query.answer("Duplicate Cleaner approved.")
-            await show_chat_menu(query, chat_id)
-            return
+        await show_chat_list(
+            query
+        )
 
-        if data.startswith("chat:"):
-            chat_id = int(data.split(":", 1)[1])
-            await query.answer()
-            await show_chat_menu(query, chat_id)
-            return
+        return
 
-        if data.startswith("dclean:"):
-            chat_id = int(data.split(":", 1)[1])
-            await start_dclean(query, chat_id)
-            return
+    # ADMIN LIST
+    if data == "admins":
 
-        if data.startswith("psettings:"):
-            chat_id = int(data.split(":", 1)[1])
-            await query.answer()
-            await show_purge_settings(query, chat_id)
-            return
+        await show_admin_panel(
+            query
+        )
 
-        if data.startswith("ptime:"):
-            _, chat_id_s, minutes_s = data.split(":")
-            await set_purge_interval_from_button(
-                query,
-                int(chat_id_s),
-                int(minutes_s),
+        return
+
+    # ADD ADMIN
+    if data == "addadmin":
+
+        input_states[
+            user.id
+        ] = {
+            "action": "add_admin"
+        }
+
+        await query.edit_message_text(
+            "➕ <b>ADD ADMIN</b>\n\n"
+            "Send Telegram numeric User ID.\n\n"
+            "Example:\n"
+            "<code>123456789</code>\n\n"
+            "Use /cancel to cancel.",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # REMOVE ADMIN
+    if data == "removeadmin":
+
+        input_states[
+            user.id
+        ] = {
+            "action": "remove_admin"
+        }
+
+        await query.edit_message_text(
+            "❌ <b>REMOVE ADMIN</b>\n\n"
+            "Send Telegram numeric User ID.\n\n"
+            "Use /cancel to cancel.",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # CHAT PANEL
+    if data.startswith("chat:"):
+
+        chat_id = int(
+            data.split(":")[1]
+        )
+
+        await show_chat_panel(
+            query,
+            chat_id
+        )
+
+        return
+
+    # DCLEAN
+    if data.startswith("dclean:"):
+
+        chat_id = int(
+            data.split(":")[1]
+        )
+
+        await run_dclean(
+            chat_id,
+            query.message
+        )
+
+        return
+
+    # PURGE MENU
+    if data.startswith("purge:"):
+
+        chat_id = int(
+            data.split(":")[1]
+        )
+
+        await show_purge_menu(
+            query,
+            chat_id
+        )
+
+        return
+
+    # PURGE PRESET
+    if data.startswith("pm:"):
+
+        _, chat_id_text, minutes_text = data.split(":")
+
+        chat_id = int(
+            chat_id_text
+        )
+
+        minutes = int(
+            minutes_text
+        )
+
+        if minutes not in PURGE_PRESETS.values():
+
+            await query.answer(
+                "Invalid duration.",
+                show_alert=True
             )
+
             return
 
-        if data.startswith("pcustom:"):
-            chat_id = int(data.split(":", 1)[1])
-            await custom_time_prompt(query, chat_id)
-            return
+        await save_purge_settings(
+            chat_id,
+            minutes=minutes
+        )
 
-        if data.startswith("penable:"):
-            chat_id = int(data.split(":", 1)[1])
-            settings = await get_purge_settings(chat_id)
-            minutes = int(settings.get("interval_minutes", 60))
-            await set_purge_settings(chat_id, True, minutes)
+        settings = await get_purge_settings(
+            chat_id
+        )
 
-            old = purge_tasks.get(chat_id)
-            if old and not old.done():
-                old.cancel()
+        await query.edit_message_text(
+            "🗑️ <b>PURGE SETTINGS SAVED</b>\n\n"
+            f"Age: <b>{duration_text(minutes)}</b>\n"
+            f"Enabled: <b>{'ON' if settings.get('enabled') else 'OFF'}</b>\n"
+            f"Duplicate Delete: <b>{'ON' if settings.get('duplicate_delete') else 'OFF'}</b>",
+            parse_mode="HTML",
+            reply_markup=purge_keyboard(
+                chat_id,
+                bool(settings.get("enabled")),
+                bool(settings.get("duplicate_delete")),
+            ),
+        )
 
-            purge_tasks[chat_id] = asyncio.create_task(purge_worker(chat_id))
+        return
 
-            await query.answer("Purge enabled.")
-            await show_purge_settings(query, chat_id)
-            return
+    # CUSTOM MINUTES
+    if data.startswith("custom:"):
 
-        if data.startswith("pdisable:"):
-            chat_id = int(data.split(":", 1)[1])
-            await disable_purge(query, chat_id)
-            return
+        chat_id = int(
+            data.split(":")[1]
+        )
 
-        if data.startswith("purge:"):
-            chat_id = int(data.split(":", 1)[1])
-            settings = await get_purge_settings(chat_id)
+        input_states[
+            user.id
+        ] = {
+            "action": "custom_minutes",
+            "chat_id": chat_id,
+        }
 
-            if not settings.get("enabled"):
-                await query.answer(
-                    "Purge is OFF. Open Purge Settings to enable it.",
-                    show_alert=True,
+        await query.edit_message_text(
+            "⚙️ <b>CUSTOM PURGE MINUTES</b>\n\n"
+            "Send the number of minutes.\n\n"
+            "Example:\n"
+            "<code>45</code>\n\n"
+            "Use /cancel to cancel.",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # DUPLICATE DELETE TOGGLE
+    if data.startswith("dup:"):
+
+        chat_id = int(
+            data.split(":")[1]
+        )
+
+        settings = await get_purge_settings(
+            chat_id
+        )
+
+        new_value = not bool(
+            settings.get(
+                "duplicate_delete",
+                False
+            )
+        )
+
+        await save_purge_settings(
+            chat_id,
+            duplicate_delete=new_value
+        )
+
+        await show_purge_menu(
+            query,
+            chat_id
+        )
+
+        return
+
+    # PURGE ENABLE/DISABLE
+    if data.startswith("toggle:"):
+
+        chat_id = int(
+            data.split(":")[1]
+        )
+
+        settings = await get_purge_settings(
+            chat_id
+        )
+
+        new_enabled = not bool(
+            settings.get(
+                "enabled",
+                False
+            )
+        )
+
+        await save_purge_settings(
+            chat_id,
+            enabled=new_enabled
+        )
+
+        if new_enabled:
+
+            ensure_purge_worker(
+                chat_id
+            )
+
+        else:
+
+            await stop_purge_worker(
+                chat_id
+            )
+
+        await show_purge_menu(
+            query,
+            chat_id
+        )
+
+        return
+
+    # RUN PURGE NOW
+    if data.startswith("runpurge:"):
+
+        chat_id = int(
+            data.split(":")[1]
+        )
+
+        settings = await get_purge_settings(
+            chat_id
+        )
+
+        await run_purge(
+            chat_id,
+            int(
+                settings.get(
+                    "minutes",
+                    60
                 )
-                return
+            ),
+            bool(
+                settings.get(
+                    "duplicate_delete",
+                    False
+                )
+            ),
+            query.message
+        )
 
-            await query.answer("Purge is running automatically.")
-            await show_purge_settings(query, chat_id)
+        return
+
+    # STATUS
+    if data.startswith("status:"):
+
+        chat_id = int(
+            data.split(":")[1]
+        )
+
+        settings = await get_purge_settings(
+            chat_id
+        )
+
+        last_id = await get_last_dclean_id(
+            chat_id
+        )
+
+        worker = purge_tasks.get(
+            chat_id
+        )
+
+        worker_running = (
+            worker is not None
+            and not worker.done()
+        )
+
+        await query.edit_message_text(
+            "📊 <b>STATUS</b>\n\n"
+            f"♻️ DCLEAN Last ID: <code>{last_id}</code>\n"
+            f"🗑️ Purge: <b>{'ON' if settings.get('enabled') else 'OFF'}</b>\n"
+            f"⏱️ Purge Age: <b>{duration_text(int(settings.get('minutes', 60)))}</b>\n"
+            f"♻️ Duplicate Delete: <b>{'ON' if settings.get('duplicate_delete') else 'OFF'}</b>\n"
+            f"⚙️ Worker: <b>{'RUNNING' if worker_running else 'STOPPED'}</b>",
+            parse_mode="HTML",
+            reply_markup=chat_keyboard(
+                chat_id
+            ),
+        )
+
+        return
+
+
+# ============================================================
+# ADMIN TEXT INPUT
+# ============================================================
+
+async def text_input_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user = update.effective_user
+
+    if not user:
+        return
+
+    if not await is_admin(
+        user.id
+    ):
+        return
+
+    state = input_states.get(
+        user.id
+    )
+
+    if not state:
+        return
+
+    text = (
+        update.message.text or ""
+    ).strip()
+
+    action = state.get(
+        "action"
+    )
+
+    # --------------------------------------------------------
+    # ADD ADMIN
+    # --------------------------------------------------------
+
+    if action == "add_admin":
+
+        try:
+
+            target_id = int(
+                text
+            )
+
+        except ValueError:
+
+            await update.message.reply_text(
+                "❌ Invalid User ID.\n\n"
+                "Send numeric Telegram User ID."
+            )
+
             return
 
-    except Exception as e:
-        logger.exception("Callback failed: %s", e)
+        await add_admin(
+            target_id,
+            user.id
+        )
+
+        input_states.pop(
+            user.id,
+            None
+        )
+
+        await update.message.reply_text(
+            "✅ <b>ADMIN ADDED</b>\n\n"
+            f"User ID: <code>{target_id}</code>",
+            parse_mode="HTML",
+            reply_markup=main_keyboard(),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # REMOVE ADMIN
+    # --------------------------------------------------------
+
+    if action == "remove_admin":
+
         try:
-            await query.answer("❌ Something went wrong.", show_alert=True)
-        except Exception:
-            pass
+
+            target_id = int(
+                text
+            )
+
+        except ValueError:
+
+            await update.message.reply_text(
+                "❌ Invalid User ID."
+            )
+
+            return
+
+        if target_id in ENV_ADMIN_IDS:
+
+            await update.message.reply_text(
+                "❌ This admin is protected by "
+                "the ADMIN_IDS Config Var."
+            )
+
+            return
+
+        removed = await remove_admin(
+            target_id
+        )
+
+        input_states.pop(
+            user.id,
+            None
+        )
+
+        if removed:
+
+            text_out = (
+                "✅ <b>ADMIN REMOVED</b>\n\n"
+                f"User ID: <code>{target_id}</code>"
+            )
+
+        else:
+
+            text_out = (
+                "⚠️ Admin not found.\n\n"
+                f"User ID: <code>{target_id}</code>"
+            )
+
+        await update.message.reply_text(
+            text_out,
+            parse_mode="HTML",
+            reply_markup=main_keyboard(),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # CUSTOM PURGE
+    # --------------------------------------------------------
+
+    if action == "custom_minutes":
+
+        try:
+
+            minutes = int(
+                text
+            )
+
+        except ValueError:
+
+            await update.message.reply_text(
+                "❌ Enter only a number.\n\n"
+                "Example: <code>45</code>",
+                parse_mode="HTML",
+            )
+
+            return
+
+        if minutes < 1:
+
+            await update.message.reply_text(
+                "❌ Minutes must be at least 1."
+            )
+
+            return
+
+        chat_id = int(
+            state["chat_id"]
+        )
+
+        await save_purge_settings(
+            chat_id,
+            minutes=minutes
+        )
+
+        input_states.pop(
+            user.id,
+            None
+        )
+
+        await update.message.reply_text(
+            "✅ <b>CUSTOM PURGE TIME SAVED</b>\n\n"
+            f"Age: <b>{duration_text(minutes)}</b>",
+            parse_mode="HTML",
+            reply_markup=main_keyboard(),
+        )
+
+        return
 
 
 # ============================================================
-# START PURGE WORKERS AFTER RESTART
+# BOT ADDED / REMOVED
 # ============================================================
 
-async def restore_purge_workers():
-    cursor = purge_settings.find({"enabled": True})
+async def my_chat_member_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    async for row in cursor:
-        chat_id = int(row["_id"])
-        old = purge_tasks.get(chat_id)
+    member_update = update.my_chat_member
 
-        if old and not old.done():
-            continue
+    if not member_update:
+        return
 
-        purge_tasks[chat_id] = asyncio.create_task(
-            purge_worker(chat_id)
+    chat = member_update.chat
+
+    if chat.type not in (
+        "group",
+        "supergroup",
+        "channel",
+    ):
+        return
+
+    new_status = (
+        member_update
+        .new_chat_member
+        .status
+    )
+
+    active_statuses = {
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.OWNER,
+        ChatMemberStatus.RESTRICTED,
+    }
+
+    if new_status in active_statuses:
+
+        await register_chat(
+            chat
         )
 
         logger.info(
-            "Restored purge worker for %s (%s)",
-            chat_id,
-            format_interval(int(row.get("interval_minutes", 60))),
+            "Registered chat: %s (%s)",
+            chat.title,
+            chat.id
+        )
+
+    else:
+
+        await deactivate_chat(
+            chat.id
+        )
+
+        await stop_purge_worker(
+            chat.id
+        )
+
+        logger.info(
+            "Removed chat: %s (%s)",
+            chat.title,
+            chat.id
         )
 
 
 # ============================================================
-# TELEGRAM BOT OBJECT
+# MESSAGE WATCHER
 # ============================================================
 
-tg_bot = None
+async def message_watcher(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
+    chat = update.effective_chat
 
-# ============================================================
-# POST INIT / SHUTDOWN
-# ============================================================
+    if not chat:
+        return
 
-async def post_init(application: Application):
-    global tg_bot
-    tg_bot = application.bot
+    if chat.type not in (
+        "group",
+        "supergroup",
+        "channel",
+    ):
+        return
 
-    await ensure_tg()
-
-    try:
-        await dclean_state.create_index(
-            [("_id", 1)],
-            unique=True,
-        )
-
-        await media_fingerprints.create_index(
-            [
-                ("chat_id", 1),
-                ("media_type", 1),
-                ("fingerprint", 1),
-            ],
-            unique=True,
-        )
-
-        await purge_settings.create_index(
-            [("_id", 1)],
-            unique=True,
-        )
-
-        await purge_cycles.create_index(
-            [("_id", 1)],
-            unique=True,
-        )
-
-        await purge_cycles.create_index(
-            [("cycle_started_at", 1)],
-        )
-
-    except Exception as e:
-        logger.warning("Mongo index setup warning: %s", e)
-
-    me = await tg.get_me()
-    logger.info(
-        "String Session connected: %s (%s)",
-        me.first_name,
-        me.id,
+    await register_chat(
+        chat
     )
 
+
+async def channel_post_watcher(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat = update.effective_chat
+
+    if not chat:
+        return
+
+    if chat.type != "channel":
+        return
+
+    await register_chat(
+        chat
+    )
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+async def post_init(
+    application: Application
+):
+
+    global tg
+    global telegram_bot
+
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN is missing"
+        )
+
+    if not MONGO_URI:
+        raise RuntimeError(
+            "MONGO_URI is missing"
+        )
+
+    if not API_ID:
+        raise RuntimeError(
+            "API_ID is missing"
+        )
+
+    if not API_HASH:
+        raise RuntimeError(
+            "API_HASH is missing"
+        )
+
+    if not STRING_SESSION:
+        raise RuntimeError(
+            "STRING_SESSION is missing"
+        )
+
+    await init_database()
+
+    await seed_environment_admins()
+
+    telegram_bot = application.bot
+
+    # Existing StringSession.
+    tg = TelegramClient(
+        StringSession(
+            STRING_SESSION
+        ),
+        API_ID,
+        API_HASH,
+    )
+
+    await tg.connect()
+
+    if not await tg.is_user_authorized():
+
+        raise RuntimeError(
+            "STRING_SESSION is not authorized."
+        )
+
+    me = await application.bot.get_me()
+
+    logger.info(
+        "Bot started: @%s",
+        me.username
+    )
+
+    logger.info(
+        "Telethon StringSession connected."
+    )
+
+    # Restore MongoDB-enabled purge workers.
     await restore_purge_workers()
 
 
-async def post_shutdown(application: Application):
-    for task in list(dclean_tasks.values()) + list(purge_tasks.values()):
-        if task and not task.done():
-            task.cancel()
+# ============================================================
+# SHUTDOWN
+# ============================================================
 
-    try:
-        await tg.disconnect()
-    except Exception:
-        pass
+async def post_shutdown(
+    application: Application
+):
 
-    try:
+    global tg
+    global mongo
+
+    for chat_id in list(
+        purge_tasks.keys()
+    ):
+
+        try:
+
+            await stop_purge_worker(
+                chat_id
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Worker shutdown error"
+            )
+
+    if tg:
+
+        try:
+
+            await tg.disconnect()
+
+        except Exception:
+
+            logger.exception(
+                "Telethon disconnect error"
+            )
+
+    if mongo:
+
         mongo.close()
-    except Exception:
-        pass
 
 
 # ============================================================
@@ -1383,6 +2518,7 @@ async def post_shutdown(application: Application):
 # ============================================================
 
 def main():
+
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -1391,50 +2527,70 @@ def main():
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start))
-
-    # Legacy command retained for initial approval from LOG_CHAT_ID.
+    # Commands
     application.add_handler(
-        CommandHandler("approvedupe", approvedupe_command)
-    )
-
-    application.add_handler(
-        ChatMemberHandler(
-            bot_membership_update,
-            ChatMemberHandler.MY_CHAT_MEMBER,
+        CommandHandler(
+            "start",
+            start_command
         )
     )
 
     application.add_handler(
-        CallbackQueryHandler(callback_handler)
+        CommandHandler(
+            "cancel",
+            cancel_command
+        )
     )
 
-    # Purge captures messages in approved/active chats.
+    # Bot added/removed from group/channel
+    application.add_handler(
+        ChatMemberHandler(
+            my_chat_member_handler,
+            ChatMemberHandler.MY_CHAT_MEMBER,
+        )
+    )
+
+    # Channel posts
+    application.add_handler(
+        ChannelPostHandler(
+            channel_post_watcher,
+            filters.ALL,
+        )
+    )
+
+    # Button callbacks
+    application.add_handler(
+        CallbackQueryHandler(
+            callback_handler
+        )
+    )
+
+    # Text input for Add Admin / Remove Admin /
+    # Custom Purge Minutes
     application.add_handler(
         MessageHandler(
-            filters.ALL,
-            purge_message_capture,
+            filters.TEXT & ~filters.COMMAND,
+            text_input_handler,
+        )
+    )
+
+    # Register groups/supergroups.
+    application.add_handler(
+        MessageHandler(
+            filters.ALL & ~filters.COMMAND,
+            message_watcher,
         ),
         group=10,
     )
 
-    # Admin custom purge time input.
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            custom_time_message,
-        ),
-        group=20,
-    )
-
-    logger.info("Bot started.")
     application.run_polling(
         allowed_updates=[
             "message",
             "channel_post",
             "callback_query",
             "my_chat_member",
-        ]
+        ],
+        drop_pending_updates=False,
     )
 
 
