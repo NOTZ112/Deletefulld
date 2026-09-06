@@ -2242,7 +2242,7 @@ async def post_shutdown(
 # MAIN
 # ============================================================
 
-def main():
+async def run_application():
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -2253,17 +2253,11 @@ def main():
 
     # Commands
     application.add_handler(
-        CommandHandler(
-            "start",
-            start_command,
-        )
+        CommandHandler("start", start_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "cancel",
-            cancel_command,
-        )
+        CommandHandler("cancel", cancel_command)
     )
 
     # Bot membership changes
@@ -2276,9 +2270,7 @@ def main():
 
     # Buttons
     application.add_handler(
-        CallbackQueryHandler(
-            callback_handler
-        )
+        CallbackQueryHandler(callback_handler)
     )
 
     # Private text input
@@ -2291,9 +2283,7 @@ def main():
         )
     )
 
-    # Channel posts.
-    # PTB 22.3 does NOT have ChannelPostHandler.
-    # TypeHandler is the correct solution.
+    # Channel posts
     application.add_handler(
         TypeHandler(
             Update,
@@ -2302,7 +2292,7 @@ def main():
         group=1,
     )
 
-    # Group/Supergroup registration.
+    # Group / Supergroup registration
     application.add_handler(
         MessageHandler(
             filters.ALL
@@ -2320,7 +2310,19 @@ def main():
         "Duplicate Cleaner starting..."
     )
 
-    application.run_polling(
+    # --------------------------------------------------------
+    # Python 3.14 SAFE STARTUP
+    # --------------------------------------------------------
+
+    await application.initialize()
+    await application.start()
+
+    if application.updater is None:
+        raise RuntimeError(
+            "Updater is not available."
+        )
+
+    await application.updater.start_polling(
         allowed_updates=[
             "message",
             "channel_post",
@@ -2328,6 +2330,45 @@ def main():
             "my_chat_member",
         ],
         drop_pending_updates=False,
+    )
+
+    logger.info(
+        "Telegram polling started successfully."
+    )
+
+    try:
+        await asyncio.Event().wait()
+
+    finally:
+        logger.info(
+            "Stopping Duplicate Cleaner..."
+        )
+
+        try:
+            await application.updater.stop()
+        except Exception:
+            logger.exception(
+                "Updater stop failed"
+            )
+
+        try:
+            await application.stop()
+        except Exception:
+            logger.exception(
+                "Application stop failed"
+            )
+
+        try:
+            await application.shutdown()
+        except Exception:
+            logger.exception(
+                "Application shutdown failed"
+            )
+
+
+def main():
+    asyncio.run(
+        run_application()
     )
 
 
