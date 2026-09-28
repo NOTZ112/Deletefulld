@@ -7,7 +7,7 @@ from html import escape
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING, UpdateOne
 
-from telethon import TelegramClient
+from telethon import TelegramClient, functions, types
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError
 
@@ -2765,25 +2765,114 @@ async def update_dclean_progress(
 # PENDING JOIN REQUESTS - ADMIN ONLY
 # ============================================================
 
+async def get_telethon_pending_requests(chat_id):
+    """Read pending join requests through the MTProto user session."""
+    if telethon_client is None:
+        return []
+
+    entity = await telethon_client.get_input_entity(chat_id)
+
+    result = await telethon_client(
+        functions.messages.GetChatInviteImportersRequest(
+            peer=entity,
+            requested=True,
+            subscription_expired=None,
+            link=None,
+            q=None,
+            offset_date=0,
+            offset_user=types.InputUserEmpty(),
+            limit=100,
+        )
+    )
+
+    users = {
+        int(u.id): u
+        for u in getattr(result, "users", [])
+        if getattr(u, "id", None) is not None
+    }
+
+    pending = []
+    for importer in getattr(result, "importers", []):
+        uid = getattr(importer, "user_id", None)
+        if uid is None:
+            continue
+
+        user = users.get(int(uid))
+        pending.append({
+            "user_id": int(uid),
+            "first_name": getattr(user, "first_name", None) if user else None,
+            "last_name": getattr(user, "last_name", None) if user else None,
+            "username": getattr(user, "username", None) if user else None,
+            "date": getattr(importer, "date", None),
+            "source": "telethon",
+        })
+
+    return pending
+
+
+async def approve_telethon_join_request(chat_id, user_id, approved=True):
+    """Approve/reject one request using the MTProto user session."""
+    if telethon_client is None:
+        raise RuntimeError("Telethon session is not connected")
+
+    peer = await telethon_client.get_input_entity(chat_id)
+    user = await telethon_client.get_input_entity(int(user_id))
+
+    await telethon_client(
+        functions.messages.HideChatJoinRequestRequest(
+            peer=peer,
+            user_id=user,
+            approved=bool(approved),
+        )
+    )
+
+
+async def get_pending_requests_for_chat(application, chat_id):
+    """Get live pending requests using Bot API first, then MTProto fallback."""
+    try:
+        requests = await application.bot.get_chat_join_requests(
+            chat_id,
+            limit=100,
+        )
+        return [
+            {
+                "user_id": int(req.user.id),
+                "first_name": req.user.first_name,
+                "last_name": req.user.last_name,
+                "username": req.user.username,
+                "date": getattr(req, "date", None),
+                "source": "botapi",
+            }
+            for req in requests
+        ]
+    except Exception as bot_error:
+        logger.warning(
+            "Bot API pending request lookup failed for %s: %s; trying MTProto",
+            chat_id,
+            bot_error,
+        )
+
+    try:
+        return await get_telethon_pending_requests(chat_id)
+    except Exception as mt_error:
+        logger.warning(
+            "MTProto pending request lookup failed for %s: %s",
+            chat_id,
+            mt_error,
+        )
+        return []
+
+
 async def get_pending_request_chats(application):
     """Find chats with live pending join requests.
 
-    Uses MongoDB registrations plus Telethon dialogs. This is important for
-    older pending requests because Telegram does not replay an old
-    chat_join_request update after the bot is restarted.
+    Uses Mongo registrations plus Telethon dialogs, then checks the live
+    pending-request queue. This does not depend on receiving a new
+    chat_join_request update after restart.
     """
-    global bot_user_id
-
-    if bot_user_id is None:
-        try:
-            bot_user_id = (await application.bot.get_me()).id
-        except Exception:
-            logger.exception("Could not get bot user for pending requests")
-            return []
-
     candidates = {}
 
-    # Mongo is the primary source, including inactive historical records.
+    # Mongo is the primary source, including historical registrations.
     try:
         cursor = chats_col.find({}).sort("title", ASCENDING)
         mongo_chats = await cursor.to_list(length=5000)
@@ -2791,16 +2880,16 @@ async def get_pending_request_chats(application):
             chat_id = chat.get("chat_id")
             chat_type = chat.get("type")
             if chat_id and chat_type in ("group", "supergroup", "channel"):
-                candidates[chat_id] = dict(chat)
+                candidates[int(chat_id)] = dict(chat)
     except Exception:
         logger.exception("Could not load chats from Mongo")
 
-    # Telethon fallback discovers chats that are not currently in Mongo.
+    # Telethon discovers chats that may not be registered in Mongo.
     try:
         if telethon_client is not None:
             async for dialog in telethon_client.iter_dialogs():
                 entity = dialog.entity
-                chat_id = dialog.id
+                chat_id = int(dialog.id)
 
                 if getattr(entity, "megagroup", False):
                     chat_type = "supergroup"
@@ -2824,34 +2913,44 @@ async def get_pending_request_chats(application):
     result = []
 
     for chat_id, chat in candidates.items():
+        requests = await get_pending_requests_for_chat(
+            application,
+            chat_id,
+        )
+
+        if not requests:
+            continue
+
+        # Verify bot admin status when possible. If Bot API cannot inspect the
+        # chat but the MTProto account can, keep the chat visible so the user
+        # session can manage the queue.
+        bot_admin = False
         try:
+            global bot_user_id
+            if bot_user_id is None:
+                bot_user_id = (await application.bot.get_me()).id
+
             member = await application.bot.get_chat_member(
                 chat_id,
                 bot_user_id,
             )
-
-            if member.status not in (
+            bot_admin = member.status in (
                 ChatMemberStatus.ADMINISTRATOR,
                 ChatMemberStatus.OWNER,
-            ):
-                continue
-
-            requests = await application.bot.get_chat_join_requests(
-                chat_id,
-                limit=100,
             )
-
-            if requests:
-                item = dict(chat)
-                item["request_count"] = len(requests)
-                result.append(item)
-
         except Exception as e:
             logger.debug(
-                "Pending request check skipped for %s: %s",
+                "Bot admin check unavailable for pending chat %s: %s",
                 chat_id,
                 e,
             )
+
+        item = dict(chat)
+        item["chat_id"] = chat_id
+        item["request_count"] = len(requests)
+        item["bot_admin"] = bot_admin
+        item["request_source"] = requests[0].get("source", "unknown")
+        result.append(item)
 
     result.sort(key=lambda x: str(x.get("title") or x.get("chat_id")))
     return result
@@ -2986,31 +3085,9 @@ async def load_pending_request_chats_ui(query, application, user_id):
 async def load_pending_requests_ui(query, application, chat_id):
     """Show the live pending requests for one chat."""
     try:
-        # Re-check that this bot is still an admin in the chat.
-        chats = await get_bot_admin_chats(application)
-        allowed = any(
-            chat.get("chat_id") == chat_id
-            for chat in chats
-        )
-
-        if not allowed:
-            await safe_edit(
-                query,
-                "❌ The bot is no longer an administrator in this chat.",
-                InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton(
-                            "⬅️ PENDING REQUESTS",
-                            callback_data="pendingreq",
-                        )
-                    ]
-                ]),
-            )
-            return
-
-        requests = await application.bot.get_chat_join_requests(
+        requests = await get_pending_requests_for_chat(
+            application,
             chat_id,
-            limit=100,
         )
 
         chat = await get_chat(chat_id)
@@ -3047,18 +3124,19 @@ async def load_pending_requests_ui(query, application, chat_id):
         )
 
         for req in requests:
-            u = req.user
+            uid = int(req.get("user_id"))
             name = escape(
                 " ".join(
-                    x for x in [u.first_name, u.last_name]
+                    x for x in [req.get("first_name"), req.get("last_name")]
                     if x
                 )
                 or "Unknown User"
             )
+            username_value = req.get("username")
             username = (
-                f"@{escape(u.username)}"
-                if u.username
-                else f"<code>{u.id}</code>"
+                f"@{escape(username_value)}"
+                if username_value
+                else f"<code>{uid}</code>"
             )
 
             text += f"👤 <b>{name}</b> — {username}\n"
@@ -3066,11 +3144,11 @@ async def load_pending_requests_ui(query, application, chat_id):
             buttons.append([
                 InlineKeyboardButton(
                     f"✅ ACCEPT — {name[:22]}",
-                    callback_data=f"reqaccept:{chat_id}:{u.id}",
+                    callback_data=f"reqaccept:{chat_id}:{uid}",
                 ),
                 InlineKeyboardButton(
                     "❌ REJECT",
-                    callback_data=f"reqreject:{chat_id}:{u.id}",
+                    callback_data=f"reqreject:{chat_id}:{uid}",
                 ),
             ])
 
@@ -3138,32 +3216,6 @@ async def handle_accept_all_pending_requests(
             await safe_edit(query, "❌ <b>Admin access required.</b>")
             return
 
-        # Re-check directly with Telegram that the bot is still an administrator.
-        global bot_user_id
-        if bot_user_id is None:
-            bot_user_id = (await application.bot.get_me()).id
-
-        member = await application.bot.get_chat_member(
-            chat_id,
-            bot_user_id,
-        )
-
-        if member.status not in (
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        ):
-            await safe_edit(
-                query,
-                "❌ The bot is no longer an administrator in this chat.",
-                InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "⬅️ PENDING REQUESTS",
-                        callback_data="pendingreq",
-                    )]
-                ]),
-            )
-            return
-
         await safe_edit(
             query,
             "⏳ <b>Accepting ALL pending requests...</b>\n\n"
@@ -3171,9 +3223,9 @@ async def handle_accept_all_pending_requests(
         )
 
         while True:
-            requests = await application.bot.get_chat_join_requests(
+            requests = await get_pending_requests_for_chat(
+                application,
                 chat_id,
-                limit=100,
             )
 
             if not requests:
@@ -3182,11 +3234,20 @@ async def handle_accept_all_pending_requests(
             batch_progress = 0
 
             for req in requests:
+                uid = int(req.get("user_id"))
                 try:
-                    await application.bot.approve_chat_join_request(
-                        chat_id,
-                        req.user.id,
-                    )
+                    if req.get("source") == "botapi":
+                        await application.bot.approve_chat_join_request(
+                            chat_id,
+                            uid,
+                        )
+                    else:
+                        await approve_telethon_join_request(
+                            chat_id,
+                            uid,
+                            approved=True,
+                        )
+
                     total_accepted += 1
                     batch_progress += 1
 
@@ -3203,7 +3264,7 @@ async def handle_accept_all_pending_requests(
                     logger.warning(
                         "Failed to accept join request: chat=%s user=%s error=%s",
                         chat_id,
-                        req.user.id,
+                        uid,
                         e,
                     )
 
@@ -3284,37 +3345,35 @@ async def handle_pending_request_action(
             )
             return
 
-        global bot_user_id
-        if bot_user_id is None:
-            bot_user_id = (await application.bot.get_me()).id
+        try:
+            if approve:
+                await application.bot.approve_chat_join_request(
+                    chat_id,
+                    user_id,
+                )
+            else:
+                await application.bot.decline_chat_join_request(
+                    chat_id,
+                    user_id,
+                )
+        except Exception as bot_error:
+            logger.warning(
+                "Bot API request action failed for %s/%s: %s; trying MTProto",
+                chat_id,
+                user_id,
+                bot_error,
+            )
+            await approve_telethon_join_request(
+                chat_id,
+                user_id,
+                approved=approve,
+            )
 
-        member = await application.bot.get_chat_member(
-            chat_id,
-            bot_user_id,
+        action_text = (
+            "✅ Request accepted."
+            if approve
+            else "❌ Request rejected."
         )
-
-        if member.status not in (
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        ):
-            await safe_edit(
-                query,
-                "❌ The bot is no longer an administrator in this chat.",
-            )
-            return
-
-        if approve:
-            await application.bot.approve_chat_join_request(
-                chat_id,
-                user_id,
-            )
-            action_text = "✅ Request accepted."
-        else:
-            await application.bot.decline_chat_join_request(
-                chat_id,
-                user_id,
-            )
-            action_text = "❌ Request rejected."
 
         await safe_edit(
             query,
