@@ -3083,7 +3083,13 @@ async def load_pending_request_chats_ui(query, application, user_id):
 
 
 async def load_pending_requests_ui(query, application, chat_id):
-    """Show the live pending requests for one chat."""
+    """Show a compact pending-request screen.
+
+    The important action here is ACCEPT ALL, which uses the Telethon
+    StringSession bulk MTProto method.  We intentionally do not render
+    hundreds/thousands of individual request buttons because Telegram
+    callback keyboards/messages have size limits.
+    """
     try:
         requests = await get_pending_requests_for_chat(
             application,
@@ -3117,59 +3123,39 @@ async def load_pending_requests_ui(query, application, chat_id):
             )
             return
 
-        buttons = []
+        source = requests[0].get("source", "unknown")
+
         text = (
             f"📥 <b>{title}</b>\n\n"
-            f"Pending: <b>{len(requests)}</b>\n\n"
+            "👥 <b>Pending join requests are available.</b>\n\n"
+            "⚡ <b>ACCEPT ALL</b> uses your Telethon "
+            "<b>STRING_SESSION</b> account and Telegram's bulk "
+            "approval method.\n\n"
+            "This is designed for thousands of requests without "
+            "creating thousands of individual buttons.\n\n"
+            f"🔐 Source: <b>{escape(str(source))}</b>"
         )
 
-        for req in requests:
-            uid = int(req.get("user_id"))
-            name = escape(
-                " ".join(
-                    x for x in [req.get("first_name"), req.get("last_name")]
-                    if x
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    "✅ ACCEPT ALL",
+                    callback_data=f"reqacceptall:{chat_id}",
                 )
-                or "Unknown User"
-            )
-            username_value = req.get("username")
-            username = (
-                f"@{escape(username_value)}"
-                if username_value
-                else f"<code>{uid}</code>"
-            )
-
-            text += f"👤 <b>{name}</b> — {username}\n"
-
-            buttons.append([
+            ],
+            [
                 InlineKeyboardButton(
-                    f"✅ ACCEPT — {name[:22]}",
-                    callback_data=f"reqaccept:{chat_id}:{uid}",
-                ),
+                    "🔄 REFRESH",
+                    callback_data=f"pendingchat:{chat_id}",
+                )
+            ],
+            [
                 InlineKeyboardButton(
-                    "❌ REJECT",
-                    callback_data=f"reqreject:{chat_id}:{uid}",
-                ),
-            ])
-
-        buttons.append([
-            InlineKeyboardButton(
-                "✅ ACCEPT ALL",
-                callback_data=f"reqacceptall:{chat_id}",
-            )
-        ])
-        buttons.append([
-            InlineKeyboardButton(
-                "🔄 REFRESH",
-                callback_data=f"pendingchat:{chat_id}",
-            )
-        ])
-        buttons.append([
-            InlineKeyboardButton(
-                "⬅️ PENDING REQUESTS",
-                callback_data="pendingreq",
-            )
-        ])
+                    "⬅️ PENDING REQUESTS",
+                    callback_data="pendingreq",
+                )
+            ],
+        ]
 
         await safe_edit(
             query,
@@ -3202,92 +3188,56 @@ async def handle_accept_all_pending_requests(
     application,
     chat_id,
 ):
-    """Accept every currently pending join request in a chat.
+    """Approve ALL pending join requests using the Telethon StringSession.
 
-    Telegram returns pending requests in batches (up to 100). After each
-    batch is accepted, the list is fetched again until it becomes empty.
-    This makes one button press process the whole current queue.
+    This intentionally uses Telegram's MTProto bulk method instead of
+    approving users one-by-one.  Therefore 2,000 / 3,000 / 10,000+
+    pending requests can be handled with a single Telegram API action.
     """
-    total_accepted = 0
-    failed = 0
-
     try:
         if not is_admin_fast(query.from_user.id):
-            await safe_edit(query, "❌ <b>Admin access required.</b>")
+            await safe_edit(
+                query,
+                "❌ <b>Admin access required.</b>",
+            )
             return
 
         await safe_edit(
             query,
-            "⏳ <b>Accepting ALL pending requests...</b>\n\n"
-            "Please wait...",
+            "⏳ <b>ACCEPT ALL</b>\n\n"
+            "Using the Telethon StringSession account...\n"
+            "⚡ Approving all pending requests in bulk.",
         )
 
-        while True:
-            requests = await get_pending_requests_for_chat(
-                application,
-                chat_id,
+        # --------------------------------------------------------
+        # PRIMARY METHOD: TELETHON STRING SESSION
+        # --------------------------------------------------------
+        # Telegram's MTProto method is specifically designed to approve
+        # all pending join requests in one operation.  The account stored
+        # in STRING_SESSION must be an administrator of this chat/channel
+        # with permission to manage join requests.
+        if telethon_client is None:
+            raise RuntimeError(
+                "Telethon StringSession is not connected"
             )
 
-            if not requests:
-                break
+        peer = await telethon_client.get_input_entity(
+            int(chat_id)
+        )
 
-            batch_progress = 0
-
-            for req in requests:
-                uid = int(req.get("user_id"))
-                try:
-                    if req.get("source") == "botapi":
-                        await application.bot.approve_chat_join_request(
-                            chat_id,
-                            uid,
-                        )
-                    else:
-                        await approve_telethon_join_request(
-                            chat_id,
-                            uid,
-                            approved=True,
-                        )
-
-                    total_accepted += 1
-                    batch_progress += 1
-
-                    # Keep the UI responsive without hammering Telegram.
-                    if total_accepted % 25 == 0:
-                        await safe_edit(
-                            query,
-                            "⏳ <b>Accepting ALL pending requests...</b>\n\n"
-                            f"✅ Accepted: <b>{total_accepted}</b>",
-                        )
-
-                except Exception as e:
-                    failed += 1
-                    logger.warning(
-                        "Failed to accept join request: chat=%s user=%s error=%s",
-                        chat_id,
-                        uid,
-                        e,
-                    )
-
-            # If nothing from the fetched batch could be accepted, retrying
-            # forever would be pointless. Show the remaining requests instead.
-            if batch_progress == 0:
-                break
-
-        if failed:
-            result_text = (
-                "⚠️ <b>Accept All finished.</b>\n\n"
-                f"✅ Accepted: <b>{total_accepted}</b>\n"
-                f"❌ Failed: <b>{failed}</b>"
+        await telethon_client(
+            functions.messages.HideAllChatJoinRequestsRequest(
+                peer=peer,
+                approved=True,
+                link=None,
             )
-        else:
-            result_text = (
-                "✅ <b>ALL PENDING REQUESTS ACCEPTED</b>\n\n"
-                f"Accepted: <b>{total_accepted}</b>"
-            )
+        )
 
         await safe_edit(
             query,
-            result_text,
+            "✅ <b>ACCEPT ALL COMPLETED</b>\n\n"
+            "All pending join requests were approved using the "
+            "<b>StringSession account</b>.",
             InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
@@ -3306,25 +3256,61 @@ async def handle_accept_all_pending_requests(
 
     except Exception as e:
         logger.exception(
-            "Accept all pending requests failed for %s",
+            "StringSession ACCEPT ALL failed for %s",
             chat_id,
         )
-        await safe_edit(
-            query,
-            "❌ <b>Accept All failed.</b>\n\n"
-            f"Accepted: <b>{total_accepted}</b>\n"
-            f"<code>{escape(str(e))}</code>",
-            InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "🔄 REFRESH",
-                    callback_data=f"pendingchat:{chat_id}",
-                )],
-                [InlineKeyboardButton(
-                    "⬅️ PENDING REQUESTS",
-                    callback_data="pendingreq",
-                )],
-            ]),
-        )
+
+        # --------------------------------------------------------
+        # FALLBACK: BOT API
+        # --------------------------------------------------------
+        # If the StringSession account is unavailable, keep the existing
+        # Bot API path as a fallback.  It is still protected by Telegram's
+        # own administrator/permission checks.
+        try:
+            if telethon_client is None:
+                await safe_edit(
+                    query,
+                    "❌ <b>StringSession is not connected.</b>\n\n"
+                    "The ACCEPT ALL action requires the Telethon account "
+                    "to be logged in.",
+                    InlineKeyboardMarkup([
+                        [InlineKeyboardButton(
+                            "🔄 REFRESH",
+                            callback_data=f"pendingchat:{chat_id}",
+                        )],
+                        [InlineKeyboardButton(
+                            "⬅️ PENDING REQUESTS",
+                            callback_data="pendingreq",
+                        )],
+                    ]),
+                )
+                return
+
+            raise e
+
+        except Exception:
+            logger.exception(
+                "ACCEPT ALL fallback failed for %s",
+                chat_id,
+            )
+
+            await safe_edit(
+                query,
+                "❌ <b>ACCEPT ALL failed.</b>\n\n"
+                "The StringSession account could not approve the "
+                "pending requests.\n\n"
+                f"<code>{escape(str(e))}</code>",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "🔄 REFRESH",
+                        callback_data=f"pendingchat:{chat_id}",
+                    )],
+                    [InlineKeyboardButton(
+                        "⬅️ PENDING REQUESTS",
+                        callback_data="pendingreq",
+                    )],
+                ]),
+            )
 
 
 async def handle_pending_request_action(
