@@ -2766,19 +2766,12 @@ async def update_dclean_progress(
 # ============================================================
 
 async def get_pending_request_chats(application):
-    """
-    Find registered group/supergroup/channel chats that currently have
-    pending join requests.
+    """Find chats with live pending join requests.
 
-    IMPORTANT:
-    Telegram Bot API has no method that globally lists every chat where a
-    bot is an administrator. Therefore the chat must first be known to the
-    bot (Mongo registration or a chat_join_request update). Once known, the
-    request list is read LIVE from Telegram.
+    Uses MongoDB registrations plus Telethon dialogs. This is important for
+    older pending requests because Telegram does not replay an old
+    chat_join_request update after the bot is restarted.
     """
-    chats = await get_all_chats()
-    result = []
-
     global bot_user_id
 
     if bot_user_id is None:
@@ -2788,17 +2781,49 @@ async def get_pending_request_chats(application):
             logger.exception("Could not get bot user for pending requests")
             return []
 
-    for chat in chats:
-        chat_id = chat.get("chat_id")
-        chat_type = chat.get("type")
+    candidates = {}
 
-        if not chat_id or chat_type not in (
-            "group",
-            "supergroup",
-            "channel",
-        ):
-            continue
+    # Mongo is the primary source, including inactive historical records.
+    try:
+        cursor = chats_col.find({}).sort("title", ASCENDING)
+        mongo_chats = await cursor.to_list(length=5000)
+        for chat in mongo_chats:
+            chat_id = chat.get("chat_id")
+            chat_type = chat.get("type")
+            if chat_id and chat_type in ("group", "supergroup", "channel"):
+                candidates[chat_id] = dict(chat)
+    except Exception:
+        logger.exception("Could not load chats from Mongo")
 
+    # Telethon fallback discovers chats that are not currently in Mongo.
+    try:
+        if client is not None:
+            async for dialog in client.iter_dialogs():
+                entity = dialog.entity
+                chat_id = dialog.id
+
+                if getattr(entity, "megagroup", False):
+                    chat_type = "supergroup"
+                elif getattr(entity, "broadcast", False):
+                    chat_type = "channel"
+                elif entity.__class__.__name__ == "Chat":
+                    chat_type = "group"
+                else:
+                    continue
+
+                if chat_id not in candidates:
+                    candidates[chat_id] = {
+                        "chat_id": chat_id,
+                        "title": getattr(entity, "title", None) or str(chat_id),
+                        "type": chat_type,
+                        "active": True,
+                    }
+    except Exception:
+        logger.exception("Could not discover chats through Telethon")
+
+    result = []
+
+    for chat_id, chat in candidates.items():
         try:
             member = await application.bot.get_chat_member(
                 chat_id,
@@ -2816,21 +2841,19 @@ async def get_pending_request_chats(application):
                 limit=100,
             )
 
+            if requests:
+                item = dict(chat)
+                item["request_count"] = len(requests)
+                result.append(item)
+
         except Exception as e:
-            # Do not silently turn a Telegram permission/API error into
-            # "No pending requests". It is useful for diagnostics.
-            logger.warning(
-                "Could not read pending requests for chat %s: %s",
+            logger.debug(
+                "Pending request check skipped for %s: %s",
                 chat_id,
                 e,
             )
-            continue
 
-        if requests:
-            item = dict(chat)
-            item["request_count"] = len(requests)
-            result.append(item)
-
+    result.sort(key=lambda x: str(x.get("title") or x.get("chat_id")))
     return result
 
 
@@ -3115,9 +3138,20 @@ async def handle_accept_all_pending_requests(
             await safe_edit(query, "❌ <b>Admin access required.</b>")
             return
 
-        # Re-check that the bot is still an administrator in this chat.
-        chats = await get_bot_admin_chats(application)
-        if not any(chat.get("chat_id") == chat_id for chat in chats):
+        # Re-check directly with Telegram that the bot is still an administrator.
+        global bot_user_id
+        if bot_user_id is None:
+            bot_user_id = (await application.bot.get_me()).id
+
+        member = await application.bot.get_chat_member(
+            chat_id,
+            bot_user_id,
+        )
+
+        if member.status not in (
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        ):
             await safe_edit(
                 query,
                 "❌ The bot is no longer an administrator in this chat.",
@@ -3250,10 +3284,18 @@ async def handle_pending_request_action(
             )
             return
 
-        chats = await get_bot_admin_chats(application)
-        if not any(
-            chat.get("chat_id") == chat_id
-            for chat in chats
+        global bot_user_id
+        if bot_user_id is None:
+            bot_user_id = (await application.bot.get_me()).id
+
+        member = await application.bot.get_chat_member(
+            chat_id,
+            bot_user_id,
+        )
+
+        if member.status not in (
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
         ):
             await safe_edit(
                 query,
